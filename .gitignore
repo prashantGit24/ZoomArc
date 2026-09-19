@@ -5,6 +5,9 @@ final
 build/bin
 electron-dev.log
 
+# Local Claude Code session state — not project source.
+.claude/
+
 # Native addon build output — compiled per-machine by npm run build:native,
 # not something that belongs in source control.
 native/wgc-capture/node_modules
