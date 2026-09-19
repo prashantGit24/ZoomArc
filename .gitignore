@@ -1,0 +1,11 @@
+node_modules
+dist
+release
+final
+build/bin
+electron-dev.log
+
+# Native addon build output — compiled per-machine by npm run build:native,
+# not something that belongs in source control.
+native/wgc-capture/node_modules
+native/wgc-capture/build

@@ -1,0 +1,17 @@
+{
+  "name": "wgc-capture",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows Graphics Capture native addon — screen capture with guaranteed cursor exclusion, used as the verified fallback when getDisplayMedia's cursor:'never' constraint is not honored by the system's capture backend.",
+  "main": "index.js",
+  "gypfile": true,
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^13.0.2"
+  },
+  "scripts": {
+    "build": "node-gyp rebuild"
+  }
+}

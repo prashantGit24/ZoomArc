@@ -1,0 +1,113 @@
+{
+  "name": "prashant",
+  "version": "0.11.0",
+  "private": true,
+  "description": "Screen recorder with auto zoom-on-click and a non-destructive editor",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n vite,electron -c cyan,magenta \"npm:dev:vite\" \"npm:dev:electron\"",
+    "dev:vite": "vite",
+    "dev:electron": "wait-on tcp:5174 && cross-env VITE_DEV_SERVER_URL=http://localhost:5174 electron .",
+    "build": "vite build",
+    "start": "npm run build && electron .",
+    "ffmpeg:win": "node scripts/fetch-ffmpeg.mjs win32-x64",
+    "ffmpeg:mac": "node scripts/fetch-ffmpeg.mjs darwin-arm64",
+    "build:native": "cd native/wgc-capture && npm install && npm run build",
+    "pack:win": "npm run build && npm run ffmpeg:win && npm run build:native && electron-builder --win --x64",
+    "pack:mac": "npm run build && npm run ffmpeg:mac && electron-builder --mac",
+    "pack:dir": "npm run build && electron-builder --dir"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "uiohook-napi": "^1.5.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^33.3.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^6.0.7",
+    "wait-on": "^8.0.2",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.neuralgarage.prashant",
+    "productName": "ZoomArc",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json",
+      "native/wgc-capture/index.js",
+      "native/wgc-capture/build/Release/*.node",
+      "!**/node_modules/ffmpeg-static/ffmpeg",
+      "!**/node_modules/ffmpeg-static/ffmpeg.exe"
+    ],
+    "asarUnpack": [
+      "**/node_modules/uiohook-napi/**",
+      "**/node_modules/ffmpeg-static/**",
+      "**/native/wgc-capture/build/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "build/bin/win32-x64",
+          "to": "bin"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.video",
+      "extraResources": [
+        {
+          "from": "build/bin/darwin-arm64",
+          "to": "bin"
+        }
+      ],
+      "extendInfo": {
+        "NSCameraUsageDescription": "ZoomArc records your screen.",
+        "NSMicrophoneUsageDescription": "ZoomArc records narration with your recordings."
+      }
+    },
+    "npmRebuild": false
+  },
+  "allowScripts": {
+    "electron@33.4.11": true,
+    "esbuild@0.25.12": true,
+    "ffmpeg-static@5.3.0": true,
+    "uiohook-napi@1.5.5": true
+  }
+}
