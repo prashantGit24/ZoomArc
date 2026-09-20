@@ -12,6 +12,7 @@
   <img alt="version" src="https://img.shields.io/badge/version-0.11.0-7c5cff">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows-0078D6">
   <img alt="built with" src="https://img.shields.io/badge/built%20with-Electron%20%2B%20React-61dafb">
+  <a href="LICENSE.md"><img alt="license" src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue"></a>
 </p>
 
 <p align="center">
@@ -101,3 +102,11 @@ src/
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the version history.
+
+## License
+
+ZoomArc is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+
+Free to use, study, and modify for personal, educational, or other non-commercial purposes. You may **not** sell ZoomArc, offer it as a paid product or service, bundle it into a paid product, or otherwise use it commercially without a separate commercial license from the author. Any copy or modified version you distribute must keep the license and copyright notice, and must not be presented as an official release by the original author.
+
+For commercial licensing, contact **prashantdasishaa@gmail.com**.

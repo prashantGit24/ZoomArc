@@ -3,6 +3,7 @@
   "version": "0.11.0",
   "private": true,
   "description": "Screen recorder with auto zoom-on-click and a non-destructive editor",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
