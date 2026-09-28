@@ -1,6 +1,6 @@
 {
   "name": "prashant",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "private": true,
   "description": "Screen recorder with auto zoom-on-click and a non-destructive editor",
   "license": "PolyForm-Noncommercial-1.0.0",
@@ -45,6 +45,7 @@
       "dist/**",
       "electron/**",
       "package.json",
+      "native/wgc-capture/package.json",
       "native/wgc-capture/index.js",
       "native/wgc-capture/build/Release/*.node",
       "!**/node_modules/ffmpeg-static/ffmpeg",

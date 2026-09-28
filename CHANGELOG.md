@@ -4,6 +4,14 @@ All notable changes to ZoomArc are documented here, newest first.
 
 > **A note on completeness:** detailed notes exist for every version from 0.10.0 onward. Versions 0.1.0 through 0.9.4 were early, rapid iteration (several same-day releases) before this changelog existed — they're listed below with their real release dates for the record, but without invented feature lists. Please don't read anything into their brevity beyond "detailed notes weren't kept at the time."
 
+## [0.11.1] — 2026-09-28
+
+### Fixed
+- The native Windows Graphics Capture module (the guaranteed cursor-exclusion fallback added in 0.10.0) silently failed to load in the **packaged app** — it worked fine in development, which is why this wasn't caught in 0.11.0. Anyone running the 0.11.0 installer or portable build would fall all the way through to the "can't exclude the cursor" error on every recording, even on a fully up-to-date system, since the fallback that's supposed to catch exactly that case wasn't actually available.
+  - Root cause: `native/wgc-capture`'s own `package.json` (which marks that one folder as CommonJS, overriding the project's own `"type": "module"`) was never included in the packaged build — only its `index.js` and compiled `.node` binary were. Without it, Node fell back to the project-wide module type and refused to load the addon (`require() of ES Module ... not supported`).
+  - Fix: added the missing `package.json` to the packaging file list. Verified directly against a freshly packaged build (not just in dev mode this time) — the native module now loads correctly and cursor exclusion works as intended.
+- **If you installed 0.11.0, update to this version** — 0.11.0's packaged build cannot exclude the cursor from recordings on any machine, regardless of Windows version or graphics driver.
+
 ## [0.11.0] — 2026-09-20
 
 Packaging/release bump — no functional changes from 0.10.0. Built and published as the first GitHub Release, with the native capture module included in the packaged build for the first time.
