@@ -1,11 +1,50 @@
 /**
- * Turns raw OS-space mouse events into a resampled, smoothed path in
- * normalized video space (0..1), plus a list of click times.
+ * Cursor motion engine: turns raw OS-space mouse events into a uniformly
+ * resampled, smoothed path in normalized video space (0..1), plus clicks.
+ *
+ * Everything here is zero-phase (centered Gaussian kernels over the whole,
+ * already-known recording), so smoothing never adds lag, never overshoots,
+ * and preview, scrubbing and export all read the exact same trajectory.
  */
 
 export const SAMPLE_MS = 8 // resample grid, ~120Hz
 
-function toNormalized(event, track) {
+// Cursor smoothing adapts to speed: heavy while nearly still (hand tremor),
+// light while travelling (stays accurate, but still rounds off the corners
+// that irregular OS event timing leaves in a fast move).
+const CURSOR_SIGMA_SLOW_MS = 45
+const CURSOR_SIGMA_FAST_MS = 11
+// Around a click the cursor must sit exactly on what was clicked.
+const CURSOR_SIGMA_CLICK_MS = 4
+const CLICK_SNAP_MS = 140 // how far either side of a click the snap blends out over
+const SPEED_SIGMA_MS = 40 // speed estimate is itself smoothed so tremor doesn't read as travel
+const SPEED_REF = 0.15 // normalized units/second that counts as fully "travelling"
+
+// Camera-follow target: a calm, heavily smoothed version of the path.
+const LAZY_SIGMA_MS = 140
+
+// Activity level feeding auto-zoom decisions (zoom.js): ~0 at rest, ~1 at a brisk move.
+const ACTIVITY_SIGMA_MS = 110
+const ACTIVITY_REF = 1.25 // normalized units/second
+
+// One recorded position -> normalized video space (0..1), unclamped.
+// Native takes (track.capture) are physical pixels on the video's own pixel
+// grid, relative to the captured area's origin at that moment — `origin`
+// moves with a recorded window (see 'bounds' events).
+function toNormalized(event, track, origin) {
+  const cap = track.capture
+  if (cap?.width && cap?.height) {
+    const o = origin || cap.origin || { x: 0, y: 0 }
+    return { x: (event.x - o.x) / cap.width, y: (event.y - o.y) / cap.height }
+  }
+
+  // Browser-path takes. Window capture: events and the window's bounds
+  // (fetched once at record start) are both raw physical desktop pixels.
+  const wb = track.source?.windowBounds
+  if (wb && wb.width && wb.height) {
+    return { x: (event.x - wb.x) / wb.width, y: (event.y - wb.y) / wb.height }
+  }
+
   // Windows at 125%/150% (and Retina) hand us raw pixels while Electron's
   // display bounds are in DIPs; pointerScale is the measured ratio between them.
   const k = track.pointerScale || 1
@@ -16,206 +55,304 @@ function toNormalized(event, track) {
   if (b && b.width && b.height) {
     return { x: (ex - b.x) / b.width, y: (ey - b.y) / b.height }
   }
-  // Window capture (or unknown display): assume the event space matches the
-  // recorded frame's aspect and fall back to raw pixels over video size.
   const { width, height } = track.videoSize || { width: 1920, height: 1080 }
   return { x: ex / width, y: ey / height }
 }
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v)
+const smoothstep = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t))
+
+// Last index in sorted `times` with value <= t, or -1.
+function floorIndex(times, length, t) {
+  if (length === 0 || times[0] > t) return -1
+  let lo = 0
+  let hi = length - 1
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (times[mid] <= t) lo = mid
+    else hi = mid - 1
+  }
+  return lo
+}
 
 export function buildMousePath(track) {
-  const moves = (track.events || []).filter((e) => e.type === 'move')
-  const clicks = (track.events || [])
-    .filter((e) => e.type === 'down')
-    .map((e) => ({ t: e.t / 1000, ...toNormalized(e, track) }))
+  const events = [...(track.events || [])].sort((a, b) => a.t - b.t)
+  const native = track.clock === 'native'
+
+  // Window recordings: where the window was at each moment.
+  const bounds = events.filter((e) => e.type === 'bounds')
+  const boundsT = bounds.map((e) => e.t)
+  const originAt = (t) => {
+    const b = bounds[Math.max(0, floorIndex(boundsT, bounds.length, t))]
+    return b ? { x: b.x, y: b.y } : null
+  }
+  const norm = (e) => toNormalized(e, track, originAt(e.t))
+
+  const clicks = events.filter((e) => e.type === 'down').map((e) => ({ t: e.t / 1000, ...norm(e) }))
+  const exact = exactTrack(events, norm, native)
 
   const duration = (track.durationMs || 0) / 1000
   const n = Math.max(1, Math.ceil((duration * 1000) / SAMPLE_MS) + 1)
-  const raw = new Float32Array(n * 2)
+  const { raw, inside } = resample(exact, n)
+  markHidden(events, inside, n)
 
-  if (moves.length === 0) {
-    for (let i = 0; i < n; i++) {
-      raw[i * 2] = 0.5
-      raw[i * 2 + 1] = 0.5
-    }
-  } else {
-    // Step through the resample grid, advancing a cursor into the event list
-    // and lerping between the two events that straddle each sample.
-    let j = 0
-    for (let i = 0; i < n; i++) {
-      const t = (i * SAMPLE_MS) / 1000
-      while (j < moves.length - 1 && moves[j + 1].t / 1000 <= t) j++
-      const a = moves[j]
-      const b = moves[Math.min(j + 1, moves.length - 1)]
-      const ta = a.t / 1000
-      const tb = b.t / 1000
-      const f = tb > ta ? clamp01((t - ta) / (tb - ta)) : 0
-      const pa = toNormalized(a, track)
-      const pb = toNormalized(b, track)
-      raw[i * 2] = clamp01(pa.x + (pb.x - pa.x) * f)
-      raw[i * 2 + 1] = clamp01(pa.y + (pb.y - pa.y) * f)
-    }
-  }
+  const speed = speedTrack(raw, n)
+  const clickNear = clickProximity(events, n)
 
   return {
     duration,
     clicks,
+    // The real cursor's own samples — what the drawn cursor replays 1:1.
+    exact,
     raw,
-    // Three smoothing strengths, each tuned for what reads it:
-    //   cursor - speed-adaptive, for the drawn pointer
-    //   tight  - click ripples, which should land where you actually clicked
-    //   lazy   - camera follow, which glides rather than chasing every twitch
-    cursor: smoothCursor(raw, n, 1),
-    tight: smooth(raw, n, 0.25),
-    // Feeds the camera-follow spring in zoom.js — it's the "glide" target, so
-    // it needs to be a genuinely quiet signal. Left too twitchy (a prior
-    // tightening pushed this to 0.09 chasing a "camera loses the cursor"
-    // complaint), every residual hand-tremor wiggle survives into the target
-    // and the follow spring dutifully chases it, reading as zigzag at 2x zoom.
-    lazy: smooth(raw, n, 0.055),
-    // How much the cursor is moving right now, heavily low-passed so it
-    // reflects sustained motion rather than a single fast sample — the
-    // auto-zoom engine (zoom.js) reads this to decide how long to keep
-    // holding/following after a click, and how deep a zoom is comfortable
-    // (a fast, erratic hand at 2x magnification is nauseating to watch;
-    // a calm, deliberate one isn't). Roughly 0 at rest, ~1 at a brisk flick.
-    activity: movementLevel(raw, n, ACTIVITY_ALPHA, ACTIVITY_REF),
+    // Optional smoothed glide (the Cursor panel's Smoothing slider blends to it).
+    cursor: adaptiveGaussian(raw, n, (i) => {
+      const travel = smoothstep(speed[i] / SPEED_REF)
+      const sigma = CURSOR_SIGMA_SLOW_MS + (CURSOR_SIGMA_FAST_MS - CURSOR_SIGMA_SLOW_MS) * travel
+      return (sigma + (CURSOR_SIGMA_CLICK_MS - sigma) * clickNear[i]) / SAMPLE_MS
+    }),
+    // Camera-follow target (zoom.js): a quiet signal, so tremor never moves the frame.
+    lazy: gaussian2(raw, n, LAZY_SIGMA_MS / SAMPLE_MS),
+    activity: activityTrack(raw, n),
+    // 1 while the pointer is over the recorded area and shown by the system,
+    // 0 while it's off on another monitor or hidden (e.g. while typing).
+    visible: gaussian1(inside, n, VISIBLE_SIGMA_MS / SAMPLE_MS),
     length: n,
   }
 }
 
-const ACTIVITY_ALPHA = 0.05 // low-pass strength — ~150ms time constant, well past single-sample tremor
-const ACTIVITY_REF = 0.01 // normalized units/sample that reads as "1.0 = brisk, sustained motion"
-
-// Low-passed (forward *and* backward, so it isn't lagged toward either end of
-// a move) per-sample movement magnitude, normalized against `ref` and capped
-// at 1. Shared shape with smoothCursor's internal speed estimate, but tuned
-// with a much longer time constant — that one exists to separate tremor from
-// a deliberate move within a handful of milliseconds; this one exists to
-// characterize the last several hundred milliseconds of behavior.
-function movementLevel(raw, n, alpha, ref) {
-  const level = new Float32Array(n)
-  for (let i = 1; i < n; i++) {
-    level[i] = Math.hypot(raw[i * 2] - raw[(i - 1) * 2], raw[i * 2 + 1] - raw[(i - 1) * 2 + 1])
-  }
-  let v = 0
-  for (let i = 0; i < n; i++) {
-    v += (level[i] - v) * alpha
-    level[i] = v
-  }
-  v = level[n - 1]
-  for (let i = n - 1; i >= 0; i--) {
-    v += (level[i] - v) * alpha
-    level[i] = Math.min(1, v / ref)
-  }
-  return level
-}
-
-// Exponential smoothing run forwards then backwards, which removes the lag a
-// single forward pass would introduce.
-function smooth(raw, n, alpha) {
-  const out = new Float32Array(n * 2)
-  let x = raw[0]
-  let y = raw[1]
-  for (let i = 0; i < n; i++) {
-    x += (raw[i * 2] - x) * alpha
-    y += (raw[i * 2 + 1] - y) * alpha
-    out[i * 2] = x
-    out[i * 2 + 1] = y
-  }
-  x = out[(n - 1) * 2]
-  y = out[(n - 1) * 2 + 1]
-  for (let i = n - 1; i >= 0; i--) {
-    x += (out[i * 2] - x) * alpha
-    y += (out[i * 2 + 1] - y) * alpha
-    out[i * 2] = x
-    out[i * 2 + 1] = y
-  }
-  return out
-}
+const VISIBLE_SIGMA_MS = 20
+const OFFSCREEN_MARGIN = 0.004
 
 /**
- * Speed-adaptive smoothing for the drawn cursor.
+ * Every recorded cursor position, in order, normalized but unclamped.
  *
- * A single fixed strength can't win: enough smoothing to settle the tremor of a
- * near-stationary hand also turns a fast deliberate flick into a laggy slide.
- * So the strength follows the speed — mild while slow (just enough to settle
- * hand tremor), and *off* (alpha 1, exact passthrough) once the cursor is
- * actually moving, so the drawn dot is pixel-for-pixel the recorded position —
- * no lag, no smoothing artifact — for as long as the move lasts. Only the
- * short ramp in and out of "moving" still gets any filtering at all.
- *
- * `amount` scales the whole effect; 0 passes the raw path through untouched.
+ * Samples only exist when the cursor moved, so a long gap means it sat still.
+ * Interpolating straight across that gap would invent a slow drift toward
+ * wherever the next movement started; instead the resting position is held
+ * until one sample-interval before motion resumed.
  */
-export function smoothCursor(raw, n, amount = 1) {
-  const out = new Float32Array(n * 2)
-  if (n === 0) return out
-  if (amount <= 0) {
-    out.set(raw)
-    return out
+function exactTrack(events, norm, native) {
+  const holdGap = native ? 3 : 30 // ms: longer than the sampler's own spacing
+  const lead = native ? 0.5 : 8
+  const t = []
+  const x = []
+  const y = []
+  let last = null
+  for (const e of events) {
+    let p
+    if (e.type === 'move' || e.type === 'down' || e.type === 'up') {
+      last = e
+      p = norm(e)
+    } else if (e.type === 'bounds' && last) {
+      // The window moved under a still pointer: same screen spot, new place
+      // relative to the recording.
+      p = norm({ ...last, t: e.t })
+    } else continue
+
+    const n = t.length
+    if (n && e.t - t[n - 1] > holdGap) {
+      t.push(e.t - lead)
+      x.push(x[n - 1])
+      y.push(y[n - 1])
+    }
+    t.push(e.t)
+    x.push(p.x)
+    y.push(p.y)
   }
+  return { t: Float64Array.from(t), x: Float32Array.from(x), y: Float32Array.from(y), length: t.length }
+}
 
-  const SLOW = 0.16 // strength when essentially still
-  const FAST = 1 // strength at or above REF speed — alpha 1 is raw passthrough: zero lag while moving
-  const REF = 0.0012 // normalized units per sample counted as deliberate movement
-  const SPEED_ALPHA = 0.35 // low-pass on the speed estimate itself — reacts within ~1-2 samples
-  // (well under one video frame) so the dot doesn't trail the first frames of a flick before
-  // the speed estimate catches up and alpha ramps to FAST. The estimate is itself smoothed
-  // forward *and* backward below, so this isn't even causal — it can "see" the move coming.
+/** Exact cursor position at time `t` (seconds), normalized and clamped. */
+export function exactCursorAt(path, t) {
+  const ex = path.exact
+  if (!ex || ex.length === 0) return { x: 0.5, y: 0.5 }
+  const ms = t * 1000
+  const i = floorIndex(ex.t, ex.length, ms)
+  if (i < 0) return { x: clamp01(ex.x[0]), y: clamp01(ex.y[0]) }
+  if (i >= ex.length - 1) return { x: clamp01(ex.x[ex.length - 1]), y: clamp01(ex.y[ex.length - 1]) }
+  const span = ex.t[i + 1] - ex.t[i]
+  const f = span > 0 ? (ms - ex.t[i]) / span : 0
+  return {
+    x: clamp01(ex.x[i] + (ex.x[i + 1] - ex.x[i]) * f),
+    y: clamp01(ex.y[i] + (ex.y[i + 1] - ex.y[i]) * f),
+  }
+}
 
-  // Instantaneous speed can't classify movement on its own: tremor is fast
-  // sample-to-sample while going nowhere, so it would read as deliberate and
-  // escape smoothing entirely. Low-passing the speed first separates real
-  // travel (sustained) from tremor (fast but cancelling out).
-  const speed = new Float32Array(n)
+// The exact track sampled onto the uniform grid that the camera, activity and
+// smoothing passes work on.
+function resample(exact, n) {
+  const raw = new Float32Array(n * 2)
+  const inside = new Float32Array(n).fill(1)
+  if (exact.length === 0) {
+    raw.fill(0.5)
+    return { raw, inside }
+  }
+  let j = 0
+  for (let i = 0; i < n; i++) {
+    const t = i * SAMPLE_MS
+    while (j < exact.length - 1 && exact.t[j + 1] <= t) j++
+    const k = Math.min(j + 1, exact.length - 1)
+    const span = exact.t[k] - exact.t[j]
+    const f = span > 0 ? clamp01((t - exact.t[j]) / span) : 0
+    const x = exact.x[j] + (exact.x[k] - exact.x[j]) * f
+    const y = exact.y[j] + (exact.y[k] - exact.y[j]) * f
+    const m = OFFSCREEN_MARGIN
+    if (x < -m || x > 1 + m || y < -m || y > 1 + m) inside[i] = 0
+    raw[i * 2] = clamp01(x)
+    raw[i * 2 + 1] = clamp01(y)
+  }
+  return { raw, inside }
+}
+
+// The system hid its cursor (typing in many apps, fullscreen video): so do we.
+function markHidden(events, inside, n) {
+  let hiddenFrom = null
+  const mark = (from, to) => {
+    const a = Math.max(0, Math.floor(from / SAMPLE_MS))
+    const b = Math.min(n - 1, Math.ceil(to / SAMPLE_MS))
+    for (let i = a; i <= b; i++) inside[i] = 0
+  }
+  for (const e of events) {
+    if (e.type === 'hide' && hiddenFrom == null) hiddenFrom = e.t
+    else if (e.type === 'show' && hiddenFrom != null) {
+      mark(hiddenFrom, e.t)
+      hiddenFrom = null
+    }
+  }
+  if (hiddenFrom != null) mark(hiddenFrom, n * SAMPLE_MS)
+}
+
+// Per-sample speed in normalized units/second, Gaussian-smoothed.
+function speedTrack(raw, n) {
+  const s = new Float32Array(n)
   for (let i = 1; i < n; i++) {
-    speed[i] = Math.hypot(raw[i * 2] - raw[(i - 1) * 2], raw[i * 2 + 1] - raw[(i - 1) * 2 + 1])
+    s[i] = Math.hypot(raw[i * 2] - raw[(i - 1) * 2], raw[i * 2 + 1] - raw[(i - 1) * 2 + 1]) * (1000 / SAMPLE_MS)
   }
-  let v = 0
-  for (let i = 0; i < n; i++) {
-    v += (speed[i] - v) * SPEED_ALPHA
-    speed[i] = v
-  }
-  v = speed[n - 1]
-  for (let i = n - 1; i >= 0; i--) {
-    v += (speed[i] - v) * SPEED_ALPHA
-    speed[i] = v
-  }
+  s[0] = n > 1 ? s[1] : 0
+  return gaussian1(s, n, SPEED_SIGMA_MS / SAMPLE_MS)
+}
 
-  const alphaAt = (i) => {
-    const a = SLOW + (FAST - SLOW) * Math.min(1, speed[i] / REF)
-    // Blend back toward "no smoothing" (alpha 1) as amount drops.
-    return a + (1 - a) * (1 - amount)
+function activityTrack(raw, n) {
+  const s = new Float32Array(n)
+  for (let i = 1; i < n; i++) {
+    s[i] = Math.hypot(raw[i * 2] - raw[(i - 1) * 2], raw[i * 2 + 1] - raw[(i - 1) * 2 + 1]) * (1000 / SAMPLE_MS)
   }
+  const out = gaussian1(s, n, ACTIVITY_SIGMA_MS / SAMPLE_MS)
+  for (let i = 0; i < n; i++) out[i] = Math.min(1, out[i] / ACTIVITY_REF)
+  return out
+}
 
-  let x = raw[0]
-  let y = raw[1]
-  for (let i = 0; i < n; i++) {
-    const a = alphaAt(i)
-    x += (raw[i * 2] - x) * a
-    y += (raw[i * 2 + 1] - y) * a
-    out[i * 2] = x
-    out[i * 2 + 1] = y
-  }
-  // Backward pass cancels the lag the forward pass introduced.
-  x = out[(n - 1) * 2]
-  y = out[(n - 1) * 2 + 1]
-  for (let i = n - 1; i >= 0; i--) {
-    const a = alphaAt(i)
-    x += (out[i * 2] - x) * a
-    y += (out[i * 2 + 1] - y) * a
-    out[i * 2] = x
-    out[i * 2 + 1] = y
+// 1 at a click (down or up), easing to 0 CLICK_SNAP_MS away.
+function clickProximity(events, n) {
+  const out = new Float32Array(n)
+  const reach = Math.ceil(CLICK_SNAP_MS / SAMPLE_MS)
+  for (const e of events) {
+    if (e.type !== 'down' && e.type !== 'up') continue
+    const c = e.t / SAMPLE_MS
+    const from = Math.max(0, Math.floor(c - reach))
+    const to = Math.min(n - 1, Math.ceil(c + reach))
+    for (let i = from; i <= to; i++) {
+      const v = 1 - smoothstep(Math.abs(i - c) / reach)
+      if (v > out[i]) out[i] = v
+    }
   }
   return out
+}
+
+function kernel(sigma) {
+  const r = Math.max(1, Math.ceil(sigma * 3))
+  const k = new Float32Array(r * 2 + 1)
+  const d = 2 * sigma * sigma
+  for (let i = -r; i <= r; i++) k[i + r] = Math.exp(-(i * i) / d)
+  return { k, r }
+}
+
+// Fixed-sigma Gaussian, edges handled by renormalizing (no pull toward 0).
+function gaussian1(src, n, sigma) {
+  if (sigma < 0.5) return Float32Array.from(src)
+  const { k, r } = kernel(sigma)
+  const out = new Float32Array(n)
+  for (let i = 0; i < n; i++) {
+    let sum = 0
+    let w = 0
+    const a = Math.max(0, i - r)
+    const b = Math.min(n - 1, i + r)
+    for (let j = a; j <= b; j++) {
+      const kw = k[j - i + r]
+      sum += src[j] * kw
+      w += kw
+    }
+    out[i] = sum / w
+  }
+  return out
+}
+
+function gaussian2(src, n, sigma) {
+  if (sigma < 0.5) return Float32Array.from(src)
+  const { k, r } = kernel(sigma)
+  const out = new Float32Array(n * 2)
+  for (let i = 0; i < n; i++) {
+    let sx = 0
+    let sy = 0
+    let w = 0
+    const a = Math.max(0, i - r)
+    const b = Math.min(n - 1, i + r)
+    for (let j = a; j <= b; j++) {
+      const kw = k[j - i + r]
+      sx += src[j * 2] * kw
+      sy += src[j * 2 + 1] * kw
+      w += kw
+    }
+    out[i * 2] = sx / w
+    out[i * 2 + 1] = sy / w
+  }
+  return out
+}
+
+// Gaussian whose width varies per output sample (sigmaAt returns samples).
+function adaptiveGaussian(src, n, sigmaAt) {
+  const out = new Float32Array(n * 2)
+  for (let i = 0; i < n; i++) {
+    const sigma = sigmaAt(i)
+    if (sigma < 0.35) {
+      out[i * 2] = src[i * 2]
+      out[i * 2 + 1] = src[i * 2 + 1]
+      continue
+    }
+    const r = Math.ceil(sigma * 3)
+    const d = 2 * sigma * sigma
+    let sx = 0
+    let sy = 0
+    let w = 0
+    const a = Math.max(0, i - r)
+    const b = Math.min(n - 1, i + r)
+    for (let j = a; j <= b; j++) {
+      const o = j - i
+      const kw = Math.exp(-(o * o) / d)
+      sx += src[j * 2] * kw
+      sy += src[j * 2 + 1] * kw
+      w += kw
+    }
+    out[i * 2] = sx / w
+    out[i * 2 + 1] = sy / w
+  }
+  return out
+}
+
+export function sampleScalar(buffer, length, t) {
+  const idx = (t * 1000) / SAMPLE_MS
+  const i = Math.max(0, Math.min(length - 1, Math.floor(idx)))
+  const j = Math.min(length - 1, i + 1)
+  const f = Math.max(0, Math.min(1, idx - i))
+  return buffer[i] + (buffer[j] - buffer[i]) * f
 }
 
 export function sampleAt(buffer, length, t) {
   const idx = (t * 1000) / SAMPLE_MS
   const i = Math.max(0, Math.min(length - 1, Math.floor(idx)))
   const j = Math.min(length - 1, i + 1)
-  const f = idx - i
+  const f = Math.max(0, Math.min(1, idx - i))
   return {
     x: buffer[i * 2] + (buffer[j * 2] - buffer[i * 2]) * f,
     y: buffer[i * 2 + 1] + (buffer[j * 2 + 1] - buffer[i * 2 + 1]) * f,

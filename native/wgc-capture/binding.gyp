@@ -4,7 +4,9 @@
       "target_name": "wgc_capture",
       "sources": [
         "src/addon.cpp",
-        "src/capture_engine.cpp"
+        "src/capture_engine.cpp",
+        "src/cursor_sampler.cpp",
+        "src/video_encoder.cpp"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"
@@ -25,7 +27,11 @@
           "libraries": [
             "windowsapp.lib",
             "d3d11.lib",
-            "dxgi.lib"
+            "dxgi.lib",
+            "dwmapi.lib",
+            "mfplat.lib",
+            "mfreadwrite.lib",
+            "mfuuid.lib"
           ]
         }]
       ]

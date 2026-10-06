@@ -4,6 +4,41 @@ All notable changes to ZoomArc are documented here, newest first.
 
 > **A note on completeness:** detailed notes exist for every version from 0.10.0 onward. Versions 0.1.0 through 0.9.4 were early, rapid iteration (several same-day releases) before this changelog existed — they're listed below with their real release dates for the record, but without invented feature lists. Please don't read anything into their brevity beyond "detailed notes weren't kept at the time."
 
+## [0.12.0] — 2026-10-07
+
+The precision-recording release: a new native recording engine, exact 1:1 cursor motion, and a redesigned recording screen.
+
+### Added
+- **Native 60fps recording engine (Windows).** Screens and windows are now recorded by the native capture module straight into a hardware-encoded H.264 MP4 — frames go GPU-to-GPU into the encoder and never pass through the app. Measured: a true **60 fps** capture (previously ~16–24 fps through the old path), held on 60, 120 and 144 Hz displays alike.
+  - Captures on the GPU that actually drives the recorded monitor (hybrid Intel/NVIDIA laptops previously paid a cross-GPU copy per frame).
+  - Lifts Windows' default capture-rate throttle where supported (Windows 11 24H2+).
+- **Native cursor sampler.** The real system cursor is read **2,000 times a second** on its own high-priority thread, stamped on the same hardware clock as the video frames — so cursor and video line up exactly by construction, with no estimated offsets. Also records clicks, when Windows hides the cursor (it now hides in the replay too), and the recorded window's position if you move it during a window recording.
+- **Exact 1:1 cursor replay.** The drawn cursor now reproduces your real movement exactly; verified pixel-accurate (~1 px) against on-screen content. The Cursor panel's Smoothing slider (now defaulting to 0%) still blends toward a smoothed glide if you want one.
+- **New zoom & camera motion engine.** Zoom is interpolated in log space (an even push instead of one that accelerates), pan and zoom move as one motion, the camera can no longer slam into a screen edge, and the follow looks slightly ahead so it doesn't trail the cursor. Measured 20–30× smoother camera motion on real recordings, with zero edge-stops (previously hundreds per take).
+- **Keyboard shortcuts** throughout the editor (44 in total): playback (Space/K, J/L, frame and second steps, jump between edit points, Home/End), editing (split, trim to playhead, nudge, copy/cut/paste/duplicate, delete, undo/redo), tools, timeline zoom, fullscreen and export.
+- **Keyboard Shortcuts overlay** — press **?** or **Ctrl+/**, or use **Help → Keyboard Shortcuts**.
+- **ZoomArc Help menu** replacing Electron's default one: Keyboard Shortcuts, ZoomArc on GitHub, What's New, Report an Issue, About ZoomArc.
+- **Redesigned recording screen**: a dark card with a purple dial that counts recorded minutes (the tick ring turns with the seconds), live timer, REC/fps status, chips showing exactly what's being captured (source, mic, camera, frame rate), a gradient Stop button and the global stop hotkey. Matching countdown and saving states.
+- **New logo and app icon** everywhere — title bar, favicon, window/taskbar icon, installer and app icons (`.ico`/`.icns`). `scripts/make-icons.cjs` regenerates them all from `logo/`.
+- **Live previews for every monitor**, including ones the browser engine can't see.
+
+### Fixed
+- **Video falling behind the cursor in longer recordings** — frames could queue up without limit when the screen changed quickly; the video was measured 6+ seconds behind the cursor after 15 s of motion. Gone entirely with the native engine.
+- **Cursor stutter during drags**, and cursor "teleporting" between clicks when mouse events were delivered late — fixed by native sampling (and, for the fallback path, by correcting late events using the OS's own timestamps).
+- **Window recordings: cursor in the wrong place** — positions weren't offset by where the window sat on screen.
+- **Editor preview drift** — the preview tolerated up to 150 ms of cursor-vs-video mismatch; it's now locked within ~10 ms.
+- **Cursor drawn from the wrong moment after trimming, splitting or moving a clip** in the editor.
+- **Exports showed the built-in arrow instead of your custom cursor** — the export never loaded the cursor image.
+- **Cursor stuck at the screen edge** while the pointer was on another monitor — it now fades out instead.
+- **Main display missing from the recorder** on hybrid-GPU laptops (the browser engine only listed one GPU's monitors); all monitors are now listed, main display first. Also fixed source cards collapsing when no preview was available.
+- **Redo did nothing**, and edits could record duplicate undo steps (most visible in development builds).
+- **Selection lost when a zoom merged into another**, which made Delete/Duplicate silently do nothing.
+
+### Changed
+- Native recordings are saved as `raw.mp4` (H.264, mic as AAC); older `raw.webm` takes still open and export as before.
+- Mic and webcam recordings are aligned to the first video frame when a take is saved.
+- Recordings made before 0.12.0 keep their original cursor timing (they get the new smoothing and sync improvements, but not native-clock precision).
+
 ## [0.11.1] — 2026-09-28
 
 ### Fixed

@@ -10,6 +10,7 @@ try {
 const { screen } = require('electron')
 
 const POLL_MS = 8 // ~120Hz, only used when uiohook is missing
+const OS_TICK_MS = 16 // resolution of uiohook's OS event timestamps on Windows
 
 // Plausible OS scaling factors; the measured ratio is snapped to the nearest.
 const KNOWN_SCALES = [1, 1.25, 1.5, 1.75, 2, 2.5, 3]
@@ -60,13 +61,17 @@ class MouseTracker {
     this.t0 = Date.now()
     this.running = true
 
+    this.osBaseline = Infinity
+    this.osBaselineAt = 0
+    this.lastT = 0
+
     if (uIOhook) {
       this.onMove = (e) => {
         this.probeScale(e)
-        this.push('move', e.x, e.y)
+        this.push('move', e.x, e.y, undefined, e.time)
       }
-      this.onDown = (e) => this.push('down', e.x, e.y, e.button)
-      this.onUp = (e) => this.push('up', e.x, e.y, e.button)
+      this.onDown = (e) => this.push('down', e.x, e.y, e.button, e.time)
+      this.onUp = (e) => this.push('up', e.x, e.y, e.button, e.time)
       uIOhook.on('mousemove', this.onMove)
       uIOhook.on('mousedrag', this.onMove)
       uIOhook.on('mousedown', this.onDown)
@@ -90,9 +95,29 @@ class MouseTracker {
     }, POLL_MS)
   }
 
-  push(type, x, y, button) {
+  /**
+   * Event time on the Date.now() clock. Arrival time is precise but lies when
+   * this thread stalls: queued events all land late, bunched together, and
+   * the path teleports. The OS stamp (ms since boot, ~16ms resolution) can't
+   * be late, so it caps the arrival time: normally the cap never binds; during
+   * a stall it pulls each event back to within one tick of when it happened.
+   */
+  eventTime(osTime) {
+    const arrival = Date.now()
+    if (!Number.isFinite(osTime) || osTime <= 0) return arrival
+    const d = arrival - osTime
+    // Running minimum of (arrival - osTime), allowed to creep up slowly so
+    // clock drift between the two sources can't pin it forever.
+    if (this.osBaseline !== Infinity) this.osBaseline += (arrival - this.osBaselineAt) * 0.0005
+    this.osBaselineAt = arrival
+    if (d < this.osBaseline) this.osBaseline = d
+    return Math.min(arrival, osTime + this.osBaseline + OS_TICK_MS)
+  }
+
+  push(type, x, y, button, osTime) {
     if (!this.running) return
-    const t = Date.now() - this.t0
+    const t = Math.max(this.lastT, this.eventTime(osTime) - this.t0)
+    this.lastT = t
     if (type === 'move') {
       // Drop samples that add nothing: same pixel, or closer than 4ms apart.
       const last = this.events[this.events.length - 1]

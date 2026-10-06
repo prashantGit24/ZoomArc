@@ -225,4 +225,4 @@ function exportVideo({ outPath, fps = 60, width, height, audioPath, quality = DE
   }
 }
 
-module.exports = { exportVideo, FORMATS, QUALITY_PRESETS, DEFAULT_QUALITY }
+module.exports = { exportVideo, resolveFfmpeg, FORMATS, QUALITY_PRESETS, DEFAULT_QUALITY }

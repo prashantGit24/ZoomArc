@@ -5,6 +5,8 @@
  */
 import { loadVideo, renderAllFrames } from '../render/renderJob.js'
 
+const videoMime = (p) => (/\.mp4$/i.test(p) ? 'video/mp4' : 'video/webm')
+
 let canceled = false
 window.exportHost.onCancel(() => {
   canceled = true
@@ -14,14 +16,14 @@ window.exportHost.onJob(async (job) => {
   const urls = []
   try {
     const buffer = await window.exportHost.readVideo(job.videoPath)
-    const url = URL.createObjectURL(new Blob([buffer], { type: 'video/webm' }))
+    const url = URL.createObjectURL(new Blob([buffer], { type: videoMime(job.videoPath) }))
     urls.push(url)
     const video = await loadVideo(url)
 
     let cameraVideo = null
     if (job.cameraVideoPath) {
       const camBuffer = await window.exportHost.readVideo(job.cameraVideoPath)
-      const camUrl = URL.createObjectURL(new Blob([camBuffer], { type: 'video/webm' }))
+      const camUrl = URL.createObjectURL(new Blob([camBuffer], { type: videoMime(job.cameraVideoPath) }))
       urls.push(camUrl)
       cameraVideo = await loadVideo(camUrl)
     }

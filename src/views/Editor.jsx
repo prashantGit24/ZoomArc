@@ -223,7 +223,9 @@ function applyClipChange(item, changes, sourceDuration) {
   return next
 }
 
-export default function Editor({ take, onBack }) {
+const videoMime = (p) => (/\.mp4$/i.test(p) ? 'video/mp4' : 'video/webm')
+
+export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }) {
   const { track, videoPath, cameraPath } = take
   const path = useMemo(() => buildMousePath(track), [track])
   // Same formula the component's own `duration` below resolves to — needed
@@ -290,6 +292,8 @@ export default function Editor({ take, onBack }) {
   const imagesRef = useRef(new Map())
   const projectRef = useRef(project)
   projectRef.current = project
+  const historyRef = useRef(history)
+  historyRef.current = history
   // A cursor image seeded from the user's saved default (see loadDefaultCursor
   // above) arrives as a bare data URL, not via the upload flow's readImage()
   // — which is what actually decodes an <img> and registers it in imagesRef
@@ -335,7 +339,7 @@ export default function Editor({ take, onBack }) {
     let canceled = false
     window.api.readTakeVideo(videoPath).then((buf) => {
       if (canceled) return
-      url = URL.createObjectURL(new Blob([buf], { type: 'video/webm' }))
+      url = URL.createObjectURL(new Blob([buf], { type: videoMime(videoPath) }))
       setVideoUrl(url)
       // Only bother decoding audio when the take actually recorded a mic —
       // decodeWaveform already resolves to null on a track-less/silent take,
@@ -354,7 +358,7 @@ export default function Editor({ take, onBack }) {
     if (!cameraPath) return
     let url
     window.api.readTakeVideo(cameraPath).then((buf) => {
-      url = URL.createObjectURL(new Blob([buf], { type: 'video/webm' }))
+      url = URL.createObjectURL(new Blob([buf], { type: videoMime(cameraPath) }))
       setCameraUrl(url)
     })
     return () => url && URL.revokeObjectURL(url)
@@ -447,6 +451,23 @@ export default function Editor({ take, onBack }) {
     let anchorTime = 0
     const RESYNC = 0.15
 
+    // While the recording is playing, the clock is phase-locked to the video
+    // element's own playback clock rather than only resynced once it drifts
+    // past RESYNC — otherwise the cursor/camera can run up to RESYNC ahead of
+    // or behind the pixels under them. currentTime (not per-frame callbacks):
+    // native captures are variable-frame-rate, so frames can be far apart.
+    const lockToVideo = (t) => {
+      const el = videoRef.current
+      if (!el || el.paused || el.seeking || el.readyState < 2) return 0
+      const media = el.currentTime
+      const clip = (projectRef.current.videoClips || []).find(
+        (c) => t >= c.start && t < c.end && media >= c.sourceStart - 0.1 && media <= c.sourceEnd + 0.1,
+      )
+      if (!clip) return 0
+      const err = clip.start + (media - clip.sourceStart) - t
+      return Math.abs(err) < RESYNC ? err * 0.5 : 0
+    }
+
     const syncTrack = (el, clips) => {
       if (!el) return
       const at = clipTimeAt(timeRef.current, clips)
@@ -467,6 +488,9 @@ export default function Editor({ take, onBack }) {
           anchorTime = timeRef.current
         }
         t = anchorTime + (now - anchorWall)
+        const correction = lockToVideo(t)
+        anchorTime += correction
+        t += correction
         if (t >= duration) {
           t = duration
           setPlaying(false)
@@ -581,21 +605,26 @@ export default function Editor({ take, onBack }) {
   // entry is one project snapshot (JS keeps the underlying arrays/objects
   // shared via structural sharing wherever an edit didn't touch them, so this
   // is far cheaper than "N snapshots' worth of the whole project").
+  // Same rule as undo/redo below: work out the new project and history first,
+  // then set them — a state updater that itself pushes history would push it
+  // twice whenever React double-runs updaters.
   const updateProject = useCallback((updater) => {
-    setProject((p) => {
-      const next = typeof updater === 'function' ? updater(p) : updater
-      if (next === p) return p
-      if (historyBatchRef.current) {
-        if (batchSnapshotRef.current !== null) {
-          const snapshot = batchSnapshotRef.current
-          batchSnapshotRef.current = null
-          setHistory((h) => ({ past: [...h.past, snapshot], future: [] }))
-        }
-      } else {
-        setHistory((h) => ({ past: [...h.past, p], future: [] }))
-      }
-      return next
-    })
+    const p = projectRef.current
+    const next = typeof updater === 'function' ? updater(p) : updater
+    if (next === p) return
+    let h = historyRef.current
+    if (!historyBatchRef.current) {
+      h = { past: [...h.past, p], future: [] }
+    } else if (batchSnapshotRef.current !== null) {
+      h = { past: [...h.past, batchSnapshotRef.current], future: [] }
+      batchSnapshotRef.current = null
+    }
+    if (h !== historyRef.current) {
+      historyRef.current = h
+      setHistory(h)
+    }
+    projectRef.current = next
+    setProject(next)
   }, [])
   const beginHistoryBatch = useCallback(() => {
     if (historyBatchRef.current) return // a nested/second pointerdown before the matching pointerup — ignore it
@@ -607,46 +636,217 @@ export default function Editor({ take, onBack }) {
     batchSnapshotRef.current = null
   }, [])
 
+  // Computed up front and then applied, never inside a state updater: React
+  // may run updaters twice (StrictMode), and reading projectRef in there saw
+  // the already-undone project on the second run, so redo restored nothing.
+  // Refs are advanced immediately so key-repeat undos chain correctly.
   const undo = useCallback(() => {
-    setHistory((h) => {
-      if (!h.past.length) return h
-      const prev = h.past[h.past.length - 1]
-      const cur = projectRef.current
-      setProject(prev)
-      return { past: h.past.slice(0, -1), future: [cur, ...h.future] }
-    })
+    const h = historyRef.current
+    if (!h.past.length) return
+    const prev = h.past[h.past.length - 1]
+    const next = { past: h.past.slice(0, -1), future: [projectRef.current, ...h.future] }
+    historyRef.current = next
+    projectRef.current = prev
+    setHistory(next)
+    setProject(prev)
   }, [])
 
   const redo = useCallback(() => {
-    setHistory((h) => {
-      if (!h.future.length) return h
-      const next = h.future[0]
-      const cur = projectRef.current
-      setProject(next)
-      return { past: [...h.past, cur], future: h.future.slice(1) }
-    })
+    const h = historyRef.current
+    if (!h.future.length) return
+    const restored = h.future[0]
+    const next = { past: [...h.past, projectRef.current], future: h.future.slice(1) }
+    historyRef.current = next
+    projectRef.current = restored
+    setHistory(next)
+    setProject(restored)
   }, [])
+
+  /* ------------------------------------------------------------ shortcuts */
+  // The full set is listed in components/ShortcutsOverlay.jsx (press ?).
+
+  const FRAME = 1 / 60
+  const clipboardRef = useRef(null)
+
+  const selectedItem = () => {
+    if (!selected) return null
+    return (projectRef.current[KIND_TO_ARRAY[selected.kind]] || []).find((it) => it.id === selected.id) || null
+  }
+
+  const selectionLocked = () => {
+    const key = KIND_TO_LAYER[selected?.kind]
+    if (!key || !layerLocked(key)) return false
+    flashHint('That layer is locked — unlock it in Layers to edit.')
+    return true
+  }
+
+  // Every item boundary on every track, for jumping between edits.
+  const jumpEdit = (dir) => {
+    const pts = new Set([0, duration])
+    for (const key of Object.values(KIND_TO_ARRAY)) {
+      for (const it of projectRef.current[key] || []) {
+        pts.add(it.start)
+        pts.add(it.end)
+      }
+    }
+    const sorted = [...pts].sort((a, b) => a - b)
+    const target = dir > 0 ? sorted.find((p) => p > time + 1e-3) : sorted.reverse().find((p) => p < time - 1e-3)
+    if (target != null) seek(target)
+  }
+
+  const nudgeSelected = (dt) => {
+    const it = selectedItem()
+    if (!it || selectionLocked()) return
+    const d = Math.max(-it.start, Math.min(duration - it.end, dt))
+    if (d) updateItem(selected.kind, it.id, { start: it.start + d, end: it.end + d })
+  }
+
+  const trimSelected = (edge) => {
+    const it = selectedItem()
+    if (!it || selectionLocked()) return
+    if (edge === 'start') {
+      if (time >= it.end - 0.05) return flashHint("Put the playhead before the item's end to trim its start.")
+      updateItem(selected.kind, it.id, { start: time })
+    } else {
+      if (time <= it.start + 0.05) return flashHint("Put the playhead after the item's start to trim its end.")
+      updateItem(selected.kind, it.id, { end: time })
+    }
+  }
+
+  // A copy of `item` starting at `start` (video/camera copies keep their
+  // source mapping, so they play the same footage).
+  const insertCopy = (kind, item, start) => {
+    const layerKey = KIND_TO_LAYER[kind]
+    if (layerKey && layerLocked(layerKey)) return flashHint('That layer is locked — unlock it in Layers to edit.')
+    const len = item.end - item.start
+    const s = Math.max(0, Math.min(start, duration - len))
+    const copy = { ...item, id: newId(), start: s, end: Math.min(duration, s + len), ...(kind === 'zoom' ? { auto: false } : {}) }
+    const key = KIND_TO_ARRAY[kind]
+    updateProject((p) =>
+      kind === 'zoom'
+        ? { ...p, segments: normalizeSegments([...p.segments, copy], duration) }
+        : { ...p, [key]: [...(p[key] || []), copy] },
+    )
+    setSelected({ kind, id: copy.id })
+  }
+
+  // Zoom segments can't overlap — adding, moving or pasting one onto another
+  // merges them (normalizeSegments), which retires the moved one's id. Keep
+  // the selection on the merged segment instead of pointing at nothing.
+  useEffect(() => {
+    if (selected?.kind !== 'zoom' || project.segments.some((s) => s.id === selected.id)) return
+    const here = project.segments.find((s) => time >= s.start && time <= s.end)
+    setSelected(here ? { kind: 'zoom', id: here.id } : null)
+  }, [project.segments, selected, time])
+
+  const copySelected = () => {
+    const it = selectedItem()
+    if (it) clipboardRef.current = { kind: selected.kind, item: it }
+    return !!it
+  }
 
   useEffect(() => {
     const onKey = (e) => {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
-      if (e.code === 'Space') {
+      const t = e.target
+      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable) return
+      const run = (fn) => {
         e.preventDefault()
-        togglePlay()
+        fn()
       }
-      if ((e.ctrlKey || e.metaKey) && e.code === 'KeyZ') {
-        e.preventDefault()
-        e.shiftKey ? redo() : undo()
+      const k = e.code
+
+      // The overlay handles its own Esc/? to close; nothing else acts meanwhile.
+      if (showShortcuts) return
+
+      if (e.ctrlKey || e.metaKey) {
+        if (k === 'KeyZ') return run(() => (e.shiftKey ? redo() : undo()))
+        if (k === 'KeyY') return run(redo)
+        if (k === 'KeyC' && selected) return run(copySelected)
+        if (k === 'KeyX' && selected) return run(() => copySelected() && removeSelected())
+        if (k === 'KeyV' && clipboardRef.current) {
+          const { kind, item } = clipboardRef.current
+          return run(() => insertCopy(kind, item, time))
+        }
+        if (k === 'KeyD' && selected) {
+          const it = selectedItem()
+          return run(() => it && insertCopy(selected.kind, it, it.end))
+        }
+        if (k === 'KeyB') return run(splitSelected)
+        if (k === 'KeyE') return run(runExport)
+        if (k === 'Slash') return run(() => setShowShortcuts(true))
         return
       }
-      if ((e.ctrlKey || e.metaKey) && e.code === 'KeyY') {
-        e.preventDefault()
-        redo()
+
+      if (e.altKey) {
+        if (k === 'ArrowLeft') return run(() => nudgeSelected(-(e.shiftKey ? 1 : FRAME)))
+        if (k === 'ArrowRight') return run(() => nudgeSelected(e.shiftKey ? 1 : FRAME))
         return
       }
-      if (e.code === 'ArrowLeft') seek(time - (e.shiftKey ? 1 : 1 / 30))
-      if (e.code === 'ArrowRight') seek(time + (e.shiftKey ? 1 : 1 / 30))
-      if (e.code === 'Backspace' && selected) removeSelected()
+
+      switch (k) {
+        case 'Space':
+        case 'KeyK':
+          return run(togglePlay)
+        case 'KeyJ':
+          return run(() => seek(time - 5))
+        case 'KeyL':
+          return run(() => seek(time + 5))
+        case 'ArrowLeft':
+          return run(() => seek(time - (e.shiftKey ? 1 : FRAME)))
+        case 'ArrowRight':
+          return run(() => seek(time + (e.shiftKey ? 1 : FRAME)))
+        case 'ArrowUp':
+          return run(() => jumpEdit(-1))
+        case 'ArrowDown':
+          return run(() => jumpEdit(1))
+        case 'Home':
+          return run(() => seek(0))
+        case 'End':
+          return run(() => seek(duration))
+        case 'Delete':
+        case 'Backspace':
+          if (selected) run(removeSelected)
+          return
+        case 'KeyS':
+          return run(splitSelected)
+        case 'BracketLeft':
+          return run(() => trimSelected('start'))
+        case 'BracketRight':
+          return run(() => trimSelected('end'))
+        case 'Escape':
+          return run(() => {
+            setSelected(null)
+            setTool('select')
+          })
+        case 'KeyV':
+          return run(() => setTool('select'))
+        case 'KeyZ':
+          return run(addZoom)
+        case 'KeyT':
+          return run(() => selectTool('text'))
+        case 'KeyR':
+          return run(() => selectTool('shapes'))
+        case 'KeyB':
+          return run(() => selectTool('background'))
+        case 'KeyE':
+          return run(() => selectTool('elements'))
+        case 'KeyC':
+          return run(() => selectTool('cursor'))
+        case 'KeyF':
+          return run(toggleFullscreen)
+        case 'Equal':
+        case 'NumpadAdd':
+          return run(() => setTimelineZoom((z) => Math.min(8, z * 1.5)))
+        case 'Minus':
+        case 'NumpadSubtract':
+          return run(() => setTimelineZoom((z) => Math.max(1, z / 1.5)))
+        case 'Backslash':
+          return run(() => setTimelineZoom(1))
+        case 'Slash':
+          if (e.shiftKey) run(() => setShowShortcuts(true))
+          return
+        default:
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -1126,6 +1326,7 @@ export default function Editor({ take, onBack }) {
         p.backgroundClips.map(async (c) => ({ ...c, bg: await fix(c.bg) })),
       ),
       elements: await Promise.all((p.elements || []).map(async (el) => ({ ...el, src: await toData(el.src) }))),
+      cursorImage: await toData(p.cursorImage),
     }
   }
 
@@ -1250,6 +1451,9 @@ export default function Editor({ take, onBack }) {
           </button>
           <button className="btn ghost icon" disabled={!history.future.length} onClick={redo} title="Redo (Ctrl+Shift+Z)">
             <Icon name="redo" />
+          </button>
+          <button className="btn ghost icon kbd-btn" onClick={() => setShowShortcuts(true)} title="Keyboard shortcuts (?)">
+            ?
           </button>
           <ThemeToggle />
           <button className="btn primary export-btn" disabled={queuing} onClick={runExport}>

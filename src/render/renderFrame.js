@@ -1,5 +1,5 @@
 import { cameraAt } from './zoom.js'
-import { sampleAt } from './track.js'
+import { sampleAt, sampleScalar, exactCursorAt } from './track.js'
 
 export const GRADIENTS = {
   midnight: ['#1e3a8a', '#0f172a'],
@@ -68,7 +68,7 @@ export const DEFAULT_PROJECT = {
   frameFillOnZoom: true,
   clickHighlight: true,
   showCursor: false, // the OS cursor is already in the capture unless it was hidden
-  cursorSmoothing: 1,
+  cursorSmoothing: 0, // 0 = the real cursor's exact recorded motion
   cursorSize: 1,
   cursorImage: null, // data URL of a user-uploaded cursor graphic; null draws the built-in arrow
   // Where the uploaded image's own pointer tip actually is, as a fraction of
@@ -258,7 +258,10 @@ export function renderFrame(ctx, opts) {
   // FOLLOW_K_TIGHT in zoom.js) — the recording fills the whole canvas in
   // that mode, so any lag off true centre reads much more than it does
   // inside the default's small padded frame.
-  const cam = cameraAt(t, zoomOn ? project.segments || [] : [], path, !!project.frameFillOnZoom)
+  const cam = cameraAt(t, zoomOn ? project.segments || [] : [], path, !!project.frameFillOnZoom, project.videoClips)
+  // Cursor data is on the recording's own clock; after a trim/split/move the
+  // timeline time no longer equals it.
+  const sourceT = clipTimeAt(t, project.videoClips)
 
   const scale = Math.min(w, h) / 1080
 
@@ -309,7 +312,7 @@ export function renderFrame(ctx, opts) {
   // which mean anything without the footage under them — but leaves the
   // background and every overlay layer showing, e.g. to hold on just a
   // background/text title card.
-  if (layers.video?.visible !== false && clipTimeAt(t, project.videoClips) != null) {
+  if (layers.video?.visible !== false && sourceT != null) {
     if (project.shadow > 0 && project.padding > 0 && bleedT < 1) {
       ctx.save()
       ctx.shadowColor = `rgba(0,0,0,${0.55 * project.shadow * (1 - bleedT)})`
@@ -329,10 +332,10 @@ export function renderFrame(ctx, opts) {
 
     const crop = { sx, sy, sw, sh, fullW: vw, fullH: vh }
     if (project.clickHighlight && path) {
-      drawClicks(ctx, t, path, videoRect, crop, scale)
+      drawClicks(ctx, sourceT, path, videoRect, crop, scale)
     }
     if (project.showCursor && path) {
-      drawCursor(ctx, t, path, videoRect, crop, project, images, scale)
+      drawCursor(ctx, sourceT, path, videoRect, crop, project, images, scale)
     }
     ctx.restore()
   }
@@ -539,13 +542,13 @@ function drawClicks(ctx, t, path, rect, crop, scale) {
   }
 }
 
-export function cursorAt(t, path, smoothing = 1) {
-  // The smoothing slider crossfades between the raw path and the smoothed one,
-  // so 0 gives the true recorded position and 1 the fully settled glide.
-  const a = sampleAt(path.cursor, path.length, t)
-  if (smoothing >= 1) return a
-  const b = sampleAt(path.raw, path.length, t)
-  return { x: b.x + (a.x - b.x) * smoothing, y: b.y + (a.y - b.y) * smoothing }
+export function cursorAt(t, path, smoothing = 0) {
+  // 0 = the exact recorded motion, interpolated straight from the real
+  // samples; the slider crossfades toward the smoothed glide.
+  const exact = exactCursorAt(path, t)
+  if (smoothing <= 0) return exact
+  const s = sampleAt(path.cursor, path.length, t)
+  return { x: exact.x + (s.x - exact.x) * smoothing, y: exact.y + (s.y - exact.y) * smoothing }
 }
 
 // macOS-style arrow, drawn in a 1x1 space scaled to size at draw time.
@@ -555,7 +558,9 @@ const ARROW = [
 ]
 
 function drawCursor(ctx, t, path, rect, crop, project, images, scale) {
-  const pos = cursorAt(t, path, project.cursorSmoothing ?? 1)
+  const visible = path.visible ? sampleScalar(path.visible, path.length, t) : 1
+  if (visible < 0.01) return
+  const pos = cursorAt(t, path, project.cursorSmoothing ?? 0)
   const px = rect.x + ((pos.x * crop.fullW - crop.sx) / crop.sw) * rect.w
   const py = rect.y + ((pos.y * crop.fullH - crop.sy) / crop.sh) * rect.h
 
@@ -582,6 +587,7 @@ function drawCursor(ctx, t, path, rect, crop, project, images, scale) {
     const w = h * (img.naturalWidth / img.naturalHeight)
     const hotspot = project.cursorHotspot ?? { x: 0, y: 0 }
     ctx.save()
+    ctx.globalAlpha *= visible
     ctx.imageSmoothingQuality = 'high'
     ctx.shadowColor = 'rgba(0,0,0,0.45)'
     ctx.shadowBlur = h * 0.2
@@ -592,6 +598,7 @@ function drawCursor(ctx, t, path, rect, crop, project, images, scale) {
   }
 
   ctx.save()
+  ctx.globalAlpha *= visible
   ctx.translate(px, py)
   ctx.beginPath()
   ctx.moveTo(ARROW[0][0] * size, ARROW[0][1] * size)

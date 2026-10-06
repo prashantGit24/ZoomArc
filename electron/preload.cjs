@@ -32,17 +32,15 @@ contextBridge.exposeInMainWorld('api', {
 
   reveal: (p) => ipcRenderer.invoke('shell:reveal', p),
 
-  // Windows Graphics Capture fallback — only used when getDisplayMedia's
-  // cursor:'never' constraint isn't honored by the system's capture backend.
+  // Native Windows recording; record:start takes a `native` target when used.
   nativeCaptureSupported: () => ipcRenderer.invoke('nativeCapture:isSupported'),
   nativeCaptureListMonitors: () => ipcRenderer.invoke('nativeCapture:listMonitors'),
-  nativeCaptureStart: (monitorHandle) => ipcRenderer.invoke('nativeCapture:start', monitorHandle),
-  nativeCaptureStartWindow: (hwnd) => ipcRenderer.invoke('nativeCapture:startWindow', hwnd),
-  nativeCaptureStop: () => ipcRenderer.invoke('nativeCapture:stop'),
-  onNativeCaptureFrame: (cb) => {
-    const handler = (_e, frame) => cb(frame)
-    ipcRenderer.on('nativeCapture:frame', handler)
-    return () => ipcRenderer.off('nativeCapture:frame', handler)
+  nativeCaptureGetWindowBounds: (hwnd) => ipcRenderer.invoke('nativeCapture:getWindowBounds', hwnd),
+
+  onShowShortcuts: (cb) => {
+    const handler = () => cb()
+    ipcRenderer.on('help:shortcuts', handler)
+    return () => ipcRenderer.off('help:shortcuts', handler)
   },
 
   onStopHotkey: (cb) => {

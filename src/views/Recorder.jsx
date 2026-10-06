@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import logo from '../assets/logo.png'
 import ThemeToggle from '../components/ThemeToggle.jsx'
+import RecordingScreen, { CountdownScreen } from '../components/RecordingScreen.jsx'
 
 // Small stroke-style glyphs — hand-rolled to match ThemeToggle rather than
 // pulling in an icon library for a handful of uses.
@@ -30,7 +31,7 @@ function SourceCard({ s, badge, active, onClick }) {
         </span>
       )}
       <span className="screen">
-        <img src={s.thumbnail} alt="" />
+        {s.thumbnail ? <img src={s.thumbnail} alt="" /> : <span className="screen-placeholder">{s.name}</span>}
       </span>
       <span className="meta">
         <span className="name" title={s.name}>
@@ -196,10 +197,11 @@ export default function Recorder({ takes, onTake, onRefresh }) {
   const cameraMetaRef = useRef(null) // { deviceId, label, width, height, mirror } for the take that's recording now
   const startedRef = useRef(0)
   const offsetRef = useRef(0)
+  const startWallRef = useRef(0)
+  const modeRef = useRef('native') // 'native' | 'browser'
+  const activeRef = useRef(false)
   const pendingRef = useRef(null)
   const pendingTimerRef = useRef(null)
-  const nativeActiveRef = useRef(false)
-  const nativeFrameUnsubRef = useRef(null)
 
   // Screen Recording is gated by macOS; asking desktopCapturer before it is
   // granted just returns an empty/opaque list, so check first and explain.
@@ -348,22 +350,15 @@ export default function Recorder({ takes, onTake, onRefresh }) {
     } catch (e) {
       setError(e.message)
       setState('idle')
+      activeRef.current = false
+      releaseStreams()
       window.api.cancelRecording()
-      if (nativeActiveRef.current) {
-        nativeActiveRef.current = false
-        nativeFrameUnsubRef.current?.()
-        nativeFrameUnsubRef.current = null
-        window.api.nativeCaptureStop().catch(() => {})
-      }
     }
   }
 
   // Physical capture resolution for the selected screen — bounds are in DIPs,
   // so the DPI scale factor has to be folded back in to land on the real
-  // pixel count. Without an explicit ideal here, getDisplayMedia is free to
-  // hand back a downscaled feed on a high-DPI display; asking for the exact
-  // native size is what actually makes a 4K screen record at genuine 4K
-  // instead of ffmpeg later stretching a smaller capture up to fill it.
+  // pixel count, or getDisplayMedia may hand back a downscaled feed.
   function nativeResolution() {
     const bounds = selected?.display?.bounds
     const scale = selected?.display?.scaleFactor || 1
@@ -371,151 +366,25 @@ export default function Recorder({ takes, onTake, onRefresh }) {
     return { width: Math.round(bounds.width * scale), height: Math.round(bounds.height * scale) }
   }
 
-  // Cursor-as-data: the OS cursor is never composited into recorded frames,
-  // under any setting — that's a capture-time guarantee, not something fixed
-  // up later in editing. One path only: getDisplayMedia (routed through
-  // main.cjs's setDisplayMediaRequestHandler -> desktopCapturer.getSources())
-  // with cursor:'never'. There used to be a second, legacy getUserMedia path
-  // (chromeMediaSource:'desktop') — the only capture mode that could never
-  // exclude the OS cursor, and the direct cause of a double-cursor bug once
-  // it fired. Removed outright, not migrated: recording with the OS cursor
-  // baked in is not a supported mode. Cursor handling instead moves entirely
-  // to render time — the editor's "Draw smoothed cursor" checkbox — where a
-  // synthetic sprite drawn from the independently-captured cursor track can
-  // actually be restyled, resized, or swapped after the fact.
+  // Cursor-as-data: the OS cursor is never composited into recorded frames;
+  // it's drawn at render time from the separately recorded cursor track.
   //
-  // No catch-and-retry here either: if getDisplayMedia throws, or hands back
-  // a track that didn't actually honour cursor:'never' (never assume a
-  // constraint was silently satisfied — the track's own negotiated settings
-  // are the only trustworthy answer), that's a hard failure. begin()'s own
-  // try/catch surfaces it as a visible capture-failed error state; silently
-  // retrying on the legacy path is exactly what used to re-introduce the OS
-  // cursor.
-  async function captureStream() {
-    const native = nativeResolution()
-    await window.api.armCapture(selected.id)
-
-    // Window sources go straight to the native capture module when it's
-    // available, bypassing Chromium's own window capturer entirely — on this
-    // class of hardware it's been observed to fail mid-capture (Chromium's
-    // own logs show WGC ProcessFrame errors) and silently re-serve the last
-    // good frame instead of erroring, which reads as the recording freezing
-    // on one frame while the real window keeps changing. A frozen frame is
-    // indistinguishable from genuinely static content after the fact, so
-    // there's no reliable way to catch this by inspecting the result — it has
-    // to be avoided going in. Screen sources keep the verify-then-fallback
-    // path below unchanged, since that failure mode (cursor not excluded) can
-    // be checked directly from the track's own settings. On platforms
-    // without the native module (non-Windows, or not built) this just falls
-    // through to the normal path, where this freeze hasn't been observed.
+  // Primary path (Windows): the native module records the monitor/window
+  // straight to a hardware-encoded 60fps MP4 and samples the real cursor on
+  // the same clock (see native/wgc-capture). This picks what to record.
+  async function nativeTarget() {
+    if (!(await window.api.nativeCaptureSupported().catch(() => false))) return null
     if (selected.kind === 'window') {
-      const nativeResult = await captureStreamNativeWindow()
-      if (nativeResult) return nativeResult
+      // Electron window-source ids are `window:<HWND>:0` on Windows.
+      const match = /^window:(\d+):/.exec(selected.id)
+      if (!match) return null
+      const b = await window.api.nativeCaptureGetWindowBounds(match[1]).catch(() => null)
+      return { kind: 'window', handle: match[1], width: b?.width, height: b?.height }
     }
-
-    // 60fps target for smooth zoom/motion. `ideal` (not `min`) deliberately —
-    // this constraints API rejects the whole capture outright with
-    // OverconstrainedError if a `min` can't be met, e.g. on a <60Hz display;
-    // `ideal` asks for the same 60 but degrades gracefully instead of failing.
-    const video = { cursor: 'never', frameRate: { ideal: 60, max: 60 } }
-    if (native) {
-      video.width = { ideal: native.width }
-      video.height = { ideal: native.height }
-    }
-    const stream = await navigator.mediaDevices.getDisplayMedia({ audio: false, video })
-    const settings = stream.getVideoTracks()[0]?.getSettings() || {}
-    if (settings.cursor === 'never') return { stream, cursorHidden: true }
-
-    // getDisplayMedia didn't throw, but the negotiated track's own settings
-    // say the cursor constraint wasn't actually honored — Chromium picked a
-    // capture backend (DXGI Desktop Duplication) with no concept of excluding
-    // the cursor. Never assume a requested constraint was silently satisfied;
-    // the track's own settings are the only trustworthy answer. Don't retry
-    // getDisplayMedia itself under any other flag — fall through to the
-    // Windows Graphics Capture module, which talks to the OS directly instead
-    // of hoping Chromium's backend selection cooperates.
-    stream.getTracks().forEach((t) => t.stop())
-    const nativeResult = await captureStreamNative()
-    if (nativeResult) return nativeResult
-
-    throw new Error(
-      "Your system can't currently exclude the cursor from screen recordings. This needs a " +
-        'Windows Graphics Capture-capable setup (Windows 10 2004+ with an up-to-date graphics ' +
-        'driver). Update Windows and your GPU driver, then try again.',
-    )
-  }
-
-  // Shared by captureStreamNative()/captureStreamNativeWindow() below —
-  // everything past "how the capture session actually gets started" is
-  // identical: an offscreen canvas fed by native frames, held back from
-  // captureStream() until a real first frame lands (see the black-frame
-  // comment inline), then handed back as a normal MediaStream so nothing
-  // downstream has to know which capture route produced it.
-  async function captureStreamFromNative(initialWidth, initialHeight, startCapture) {
-    const canvas = document.createElement('canvas')
-    canvas.width = initialWidth
-    canvas.height = initialHeight
-    const ctx = canvas.getContext('2d')
-
-    // A freshly created canvas is blank (renders as black), and native
-    // capture takes a moment to spin up (device/session creation) before its
-    // first frame arrives. canvas.captureStream() starts emitting the moment
-    // it's called, so if that happens before any real frame has been drawn,
-    // MediaRecorder bakes a black flash into the very start of the take.
-    // Wait for a real first frame before starting the stream at all — capped
-    // so a native capture that never delivers a frame can't hang recording
-    // forever instead of falling through to the plain-language error.
-    let resolveFirstFrame
-    const firstFrame = new Promise((resolve) => {
-      resolveFirstFrame = resolve
-    })
-
-    const unsub = window.api.onNativeCaptureFrame(({ width, height, buffer }) => {
-      if (canvas.width !== width || canvas.height !== height) {
-        canvas.width = width
-        canvas.height = height
-      }
-      const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer)
-      const pixels = new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-      ctx.putImageData(new ImageData(pixels, width, height), 0, 0)
-      resolveFirstFrame?.()
-      resolveFirstFrame = null
-    })
-
-    const started = await startCapture().catch((e) => {
-      console.warn('native capture unavailable:', e.message)
-      return false
-    })
-    if (!started) {
-      unsub()
-      return null
-    }
-
-    nativeFrameUnsubRef.current = unsub
-    nativeActiveRef.current = true
-
-    const timedOut = await Promise.race([
-      firstFrame.then(() => false),
-      new Promise((resolve) => setTimeout(() => resolve(true), 2000)),
-    ])
-    if (timedOut) console.warn('native capture: no frame arrived within 2s, starting anyway')
-
-    return { stream: canvas.captureStream(60), cursorHidden: true }
-  }
-
-  // Verified fallback for screen sources, not a silent degrade: only reached
-  // once captureStream() has already proven getDisplayMedia's cursor:'never'
-  // wasn't honored. Talks to Windows.Graphics.Capture directly via the native
-  // addon (electron/main.cjs -> native/wgc-capture), which checks
-  // IsCursorCaptureEnabled support itself and refuses to start rather than
-  // silently capturing with the cursor visible.
-  async function captureStreamNative() {
-    const supported = await window.api.nativeCaptureSupported().catch(() => false)
-    if (!supported) return null
-
     const monitors = await window.api.nativeCaptureListMonitors().catch(() => [])
     if (!monitors.length) return null
-
+    const exact = monitors.find((m) => m.handle === selected.monitor)
+    if (exact) return { kind: 'monitor', handle: exact.handle, width: exact.width, height: exact.height }
     const bounds = selected?.display?.bounds
     const scale = selected?.display?.scaleFactor || 1
     let target = monitors.find((m) => m.primary) || monitors[0]
@@ -528,39 +397,33 @@ export default function Recorder({ takes, onTake, onRefresh }) {
         return d < bestD ? m : best
       }, target)
     }
+    return { kind: 'monitor', handle: target.handle, width: target.width, height: target.height }
+  }
 
-    return captureStreamFromNative(target.width, target.height, () =>
-      window.api.nativeCaptureStart(target.handle),
+  // Fallback (no native module): getDisplayMedia with cursor:'never'. Never
+  // assume the constraint was honoured — the negotiated track's own settings
+  // are the only trustworthy answer, and recording with the OS cursor baked
+  // in is not a supported mode.
+  async function captureDisplayStream() {
+    const native = nativeResolution()
+    await window.api.armCapture(selected.id)
+    const video = { cursor: 'never', frameRate: { ideal: 60, max: 60 } }
+    if (native) {
+      video.width = { ideal: native.width }
+      video.height = { ideal: native.height }
+    }
+    const stream = await navigator.mediaDevices.getDisplayMedia({ audio: false, video })
+    if (stream.getVideoTracks()[0]?.getSettings()?.cursor === 'never') return stream
+    stream.getTracks().forEach((t) => t.stop())
+    throw new Error(
+      "Your system can't currently exclude the cursor from screen recordings. This needs a " +
+        'Windows Graphics Capture-capable setup (Windows 10 2004+ with an up-to-date graphics ' +
+        'driver). Update Windows and your GPU driver, then try again.',
     )
   }
 
-  // Unconditional for window sources when the native module is available —
-  // see the comment in captureStream() for why this doesn't wait to detect a
-  // failure first. Electron's window-source ids are formatted
-  // `window:<HWND>:0` on Windows, so the HWND is pulled straight out of the
-  // id rather than needing a separate lookup.
-  async function captureStreamNativeWindow() {
-    const supported = await window.api.nativeCaptureSupported().catch(() => false)
-    if (!supported) return null
-
-    const match = /^window:(\d+):/.exec(selected.id)
-    if (!match) return null
-    const hwnd = match[1]
-
-    return captureStreamFromNative(1920, 1080, () => window.api.nativeCaptureStartWindow(hwnd))
-  }
-
-  // H.264 first, not VP9 — VP9 has essentially no hardware encoder on most
-  // GPUs (this machine's included), so MediaRecorder falls back to software
-  // libvpx, which can't sustain 1080p60 encoding in real time: measured
-  // capture came out around 17fps despite the stream itself being requested
-  // and negotiated at 60fps — the encoder, not the capture, was the actual
-  // bottleneck. H.264 has a real hardware encode path on virtually every GPU
-  // built in the last decade (NVENC/Quick Sync/AMF), so MediaRecorder can
-  // keep up with a genuine 60fps stream instead of quietly dropping frames.
-  // Falls back to VP9 then plain webm on a machine where H.264 truly isn't
-  // available — ffmpeg reads H.264-in-WebM (or -in-MP4) equally well
-  // downstream either way, so nothing else in the pipeline needs to care.
+  // H.264 first: VP9 has no hardware encoder on most GPUs and can't sustain
+  // 1080p60 in software.
   function pickVideoMimeType() {
     for (const type of ['video/webm;codecs=h264', 'video/webm;codecs=vp9']) {
       if (MediaRecorder.isTypeSupported(type)) return type
@@ -568,15 +431,8 @@ export default function Recorder({ takes, onTake, onRefresh }) {
     return 'video/webm'
   }
 
-  // CRF-based encoding at export time adapts to whatever resolution it's
-  // given, but MediaRecorder itself has no such thing — a fixed low bitrate
-  // (this was 12 Mbps for everything, screen text included) makes a 4K
-  // capture come out soft and blocky regardless of how good the source is.
-  // Base numbers track YouTube's own recommended upload bitrates for 60fps;
-  // captureQuality's multiplier (1x/2.5x/5x, picked in the header) scales
-  // them up from there — a higher-bitrate VP9 capture also gives the
-  // editor/export pipeline a cleaner source (less of its own compression
-  // noise for the export's own encode to compound).
+  // Base numbers track YouTube's recommended 60fps upload bitrates; the
+  // capture-quality multiplier (header picker) scales them up from there.
   function bitrateFor(width, height) {
     const mult = CAPTURE_QUALITIES.find((q) => q.id === captureQuality)?.mult || 1
     const px = (width || 1920) * (height || 1080)
@@ -586,114 +442,142 @@ export default function Recorder({ takes, onTake, onRefresh }) {
     return 70_000_000 * mult
   }
 
-  async function startCapture() {
-    const { stream, cursorHidden } = await captureStream()
-
-    if (micId) {
-      try {
-        const mic = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: micId } } })
-        mic.getAudioTracks().forEach((t) => stream.addTrack(t))
-      } catch (e) {
-        console.warn('mic unavailable:', e.message)
-      }
+  async function openMic() {
+    if (!micId) return null
+    try {
+      return await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: micId } } })
+    } catch (e) {
+      console.warn('mic unavailable:', e.message)
+      return null
     }
+  }
 
-    streamRef.current = stream
-    chunksRef.current = []
+  // The webcam is its own capture so the editor can restyle/reposition it
+  // without ever re-encoding the screen recording.
+  async function openCamera() {
+    if (!cameraId) return null
+    try {
+      const resOpt = CAMERA_RESOLUTIONS.find((r) => r.id === cameraRes) || CAMERA_RESOLUTIONS[0]
+      // `ideal` only — most webcams top out at 30fps and a `min` would reject them.
+      const constraints = { deviceId: { exact: cameraId }, frameRate: { ideal: 60 } }
+      if (resOpt.w) {
+        constraints.width = { ideal: resOpt.w }
+        constraints.height = { ideal: resOpt.h }
+      } else if (cameraCaps) {
+        constraints.width = { ideal: cameraCaps.maxW }
+        constraints.height = { ideal: cameraCaps.maxH }
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ video: constraints, audio: false })
+      return { stream, settings: stream.getVideoTracks()[0]?.getSettings() || null }
+    } catch (e) {
+      console.warn('camera unavailable:', e.message)
+      return null
+    }
+  }
 
-    // The actual negotiated resolution, not the requested ideal — a device
-    // or display can still hand back less than asked for.
-    const capturedSettings = stream.getVideoTracks()[0]?.getSettings() || {}
-    const rec = new MediaRecorder(stream, {
-      mimeType: pickVideoMimeType(),
-      videoBitsPerSecond: bitrateFor(capturedSettings.width, capturedSettings.height),
-    })
-    rec.ondataavailable = (e) => e.data.size && chunksRef.current.push(e.data)
+  function makeRecorder(stream, options, chunks) {
+    const rec = new MediaRecorder(stream, options)
+    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data)
     rec.onstop = maybeFinalize
-    recorderRef.current = rec
+    return rec
+  }
 
-    // The webcam is a second, independent capture — its own stream and
-    // MediaRecorder — so the editor can restyle/reposition it later without
-    // ever having to re-encode the screen recording.
-    let cameraTrackSettings = null
-    if (cameraId) {
-      try {
-        const resOpt = CAMERA_RESOLUTIONS.find((r) => r.id === cameraRes) || CAMERA_RESOLUTIONS[0]
-        // `ideal` only — most webcams simply top out at 30fps, and a `min`
-        // here would reject the capture outright on any of them.
-        const videoConstraints = { deviceId: { exact: cameraId }, frameRate: { ideal: 60 } }
-        if (resOpt.w) {
-          videoConstraints.width = { ideal: resOpt.w }
-          videoConstraints.height = { ideal: resOpt.h }
-        } else if (cameraCaps) {
-          videoConstraints.width = { ideal: cameraCaps.maxW }
-          videoConstraints.height = { ideal: cameraCaps.maxH }
-        }
-        const camStream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false })
-        cameraStreamRef.current = camStream
-        cameraTrackSettings = camStream.getVideoTracks()[0]?.getSettings() || null
-        cameraChunksRef.current = []
-        const camRec = new MediaRecorder(camStream, {
-          mimeType: pickVideoMimeType(),
-          // Same tier system as the screen capture, base 6 Mbps.
-          videoBitsPerSecond: 6_000_000 * (CAPTURE_QUALITIES.find((q) => q.id === captureQuality)?.mult || 1),
-        })
-        camRec.ondataavailable = (e) => e.data.size && cameraChunksRef.current.push(e.data)
-        camRec.onstop = maybeFinalize
-        cameraRecorderRef.current = camRec
-      } catch (e) {
-        console.warn('camera unavailable:', e.message)
-        cameraStreamRef.current = null
-        cameraRecorderRef.current = null
-      }
-    } else {
-      cameraStreamRef.current = null
-      cameraRecorderRef.current = null
+  function releaseStreams() {
+    streamRef.current?.getTracks().forEach((t) => t.stop())
+    cameraStreamRef.current?.getTracks().forEach((t) => t.stop())
+    streamRef.current = null
+    cameraStreamRef.current = null
+  }
+
+  async function startCapture() {
+    const target = await nativeTarget()
+    // Browser mode needs its screen stream up front: it *is* the video.
+    const display = target ? null : await captureDisplayStream()
+    const mic = await openMic()
+    const cam = await openCamera()
+
+    chunksRef.current = []
+    cameraChunksRef.current = []
+    let rec = null
+    if (display) {
+      mic?.getAudioTracks().forEach((t) => display.addTrack(t))
+      const s = display.getVideoTracks()[0]?.getSettings() || {}
+      rec = makeRecorder(display, { mimeType: pickVideoMimeType(), videoBitsPerSecond: bitrateFor(s.width, s.height) }, chunksRef.current)
+    } else if (mic) {
+      // Native mode: the video is recorded natively; only the mic is here.
+      rec = makeRecorder(mic, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 192_000 }, chunksRef.current)
     }
+    streamRef.current = display || mic
+    recorderRef.current = rec
+    cameraStreamRef.current = cam?.stream || null
+    cameraRecorderRef.current = cam
+      ? makeRecorder(
+          cam.stream,
+          {
+            mimeType: pickVideoMimeType(),
+            videoBitsPerSecond: 6_000_000 * (CAPTURE_QUALITIES.find((q) => q.id === captureQuality)?.mult || 1),
+          },
+          cameraChunksRef.current,
+        )
+      : null
+    modeRef.current = target ? 'native' : 'browser'
 
     const cameraDevice = cameraId ? cameras.find((d) => d.deviceId === cameraId) : null
-
-    // Start the tracker first so mouse timestamps never precede frame zero.
-    const { t0 } = await window.api.startRecording({
-      sourceId: selected.id,
-      name: selected.name,
-      kind: selected.kind,
-      display: selected.display,
-      mic: !!micId,
-      micLabel: mics.find((d) => d.deviceId === micId)?.label || null,
-      projectName,
-      cursorHidden,
-      hideWindow: true,
-    })
+    let t0
+    try {
+      ;({ t0 } = await window.api.startRecording({
+        sourceId: selected.id,
+        name: selected.name,
+        kind: selected.kind,
+        display: selected.display,
+        native: target
+          ? { kind: target.kind, handle: target.handle, bitrate: bitrateFor(target.width, target.height) }
+          : null,
+        mic: !!mic,
+        micLabel: mics.find((d) => d.deviceId === micId)?.label || null,
+        projectName,
+        cursorHidden: true,
+        hideWindow: true,
+      }))
+    } catch (e) {
+      releaseStreams()
+      throw e
+    }
     startedRef.current = performance.now()
-    rec.start(1000)
+    rec?.start(1000)
     cameraRecorderRef.current?.start(1000)
-    // Date.now() shares an epoch with main's tracker clock (t0), unlike
-    // performance.now() above, so this gap is the real delay between the
-    // tracker's zero and the video actually starting — see record:finish.
-    offsetRef.current = Math.max(0, Date.now() - t0)
+    // Date.now() is the clock both main's tracker (t0) and the native
+    // module's frame-0 stamp are on, so this aligns mic/webcam/cursor.
+    startWallRef.current = Date.now()
+    offsetRef.current = Math.max(0, startWallRef.current - t0)
     cameraMetaRef.current = cameraDevice
       ? {
           deviceId: cameraDevice.deviceId,
           label: cameraDevice.label || 'Camera',
-          width: cameraTrackSettings?.width || null,
-          height: cameraTrackSettings?.height || null,
+          width: cam?.settings?.width || null,
+          height: cam?.settings?.height || null,
           mirror: true,
         }
       : null
+    activeRef.current = true
     setState('recording')
   }
 
+  // Uses refs only: it's also called from the global stop hotkey's handler,
+  // which was registered once and would otherwise see stale state.
   function stop() {
-    const rec = recorderRef.current
-    if (!rec || rec.state === 'inactive') return
+    if (!activeRef.current) return
+    activeRef.current = false
     setState('saving')
-    rec.stop()
-    if (cameraRecorderRef.current?.state !== 'inactive') cameraRecorderRef.current?.stop()
+    const running = [recorderRef.current, cameraRecorderRef.current].filter((r) => r && r.state !== 'inactive')
+    if (!running.length) {
+      finalize()
+      return
+    }
+    running.forEach((r) => r.stop())
   }
 
-  // Both recorders' 'stop' events land separately (they're independent
-  // MediaRecorder instances) — only finalize once neither is still running.
+  // The recorders' 'stop' events land separately — finalize once none is running.
   function maybeFinalize() {
     if (recorderRef.current && recorderRef.current.state !== 'inactive') return
     if (cameraRecorderRef.current && cameraRecorderRef.current.state !== 'inactive') return
@@ -701,31 +585,18 @@ export default function Recorder({ takes, onTake, onRefresh }) {
   }
 
   async function finalize() {
-    const stream = streamRef.current
-    const settings = stream?.getVideoTracks()[0]?.getSettings() || {}
-    stream?.getTracks().forEach((t) => t.stop())
-    const cameraStream = cameraStreamRef.current
-    cameraStream?.getTracks().forEach((t) => t.stop())
-    if (nativeActiveRef.current) {
-      nativeActiveRef.current = false
-      nativeFrameUnsubRef.current?.()
-      nativeFrameUnsubRef.current = null
-      window.api.nativeCaptureStop().catch(() => {})
-    }
+    const settings = modeRef.current === 'browser' ? streamRef.current?.getVideoTracks()[0]?.getSettings() || {} : {}
+    releaseStreams()
 
-    const blob = new Blob(chunksRef.current, { type: 'video/webm' })
-    const buffer = await blob.arrayBuffer()
-    let cameraBuffer = null
-    if (cameraChunksRef.current.length) {
-      const camBlob = new Blob(cameraChunksRef.current, { type: 'video/webm' })
-      cameraBuffer = await camBlob.arrayBuffer()
-    }
+    const buffer = chunksRef.current.length ? await new Blob(chunksRef.current).arrayBuffer() : null
+    const cameraBuffer = cameraChunksRef.current.length ? await new Blob(cameraChunksRef.current).arrayBuffer() : null
     try {
       const take = await window.api.finishRecording({
-        buffer,
+        buffer, // browser mode: screen video (+mic); native mode: mic only, or null
         durationMs: performance.now() - startedRef.current,
         videoSize: { width: settings.width || 1920, height: settings.height || 1080 },
         offsetMs: offsetRef.current,
+        startWallMs: startWallRef.current,
         cameraBuffer,
         camera: cameraMetaRef.current,
       })
@@ -737,29 +608,22 @@ export default function Recorder({ takes, onTake, onRefresh }) {
     }
   }
 
-  if (state === 'counting') {
-    return (
-      <div className="overlay">
-        <div className="count mono">{count}</div>
-        <p>Get ready…</p>
-      </div>
-    )
-  }
+  const micLabel = micId ? mics.find((d) => d.deviceId === micId)?.label || 'Microphone' : null
+  const cameraLabel = cameraId ? cameras.find((d) => d.deviceId === cameraId)?.label || 'Camera' : null
+
+  if (state === 'counting') return <CountdownScreen count={count} source={selected} mic={micLabel} camera={cameraLabel} />
 
   if (state === 'recording' || state === 'saving') {
     return (
-      <div className="overlay">
-        <div className="rec-dot" />
-        <h2>{state === 'saving' ? 'Saving…' : 'Recording'}</h2>
-        <p>
-          Press <kbd>{platform.stopHotkey}</kbd> anywhere to stop
-        </p>
-        {state === 'recording' && (
-          <button className="btn danger" onClick={stop}>
-            Stop recording
-          </button>
-        )}
-      </div>
+      <RecordingScreen
+        saving={state === 'saving'}
+        startedAt={startedRef.current}
+        source={selected}
+        mic={micLabel}
+        camera={cameraLabel}
+        stopHotkey={platform.stopHotkey}
+        onStop={stop}
+      />
     )
   }
 

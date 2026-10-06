@@ -28,6 +28,9 @@ export async function loadImages(project) {
   for (const el of project.elements || []) {
     if (el.src) srcs.add(el.src)
   }
+  // Without it drawCursor falls back to the built-in arrow, so the export
+  // would show a different cursor than the editor.
+  if (project.cursorImage) srcs.add(project.cursorImage)
   await Promise.all(
     [...srcs].filter(Boolean).map(
       (src) =>

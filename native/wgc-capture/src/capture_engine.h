@@ -8,52 +8,46 @@
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <d3d11.h>
-#include <wrl/client.h>
-#include <functional>
-#include <mutex>
+
 #include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
 
-// One captured frame, already staged to CPU memory and converted to
-// tightly-packed RGBA8 (top-down) so the JS side can hand it straight to
-// a canvas ImageData / captureStream() without any further conversion.
-struct CapturedFrame {
-  uint32_t width = 0;
-  uint32_t height = 0;
-  std::vector<uint8_t> rgba;
-};
+#include "video_encoder.h"
 
-// Wraps a single Windows.Graphics.Capture session against one monitor.
-// Cursor exclusion is requested via GraphicsCaptureSession.IsCursorCaptureEnabled(false)
-// when the running OS build exposes that property (Windows 10 2004 / build 19041+).
-// This is the whole reason this module exists: unlike getDisplayMedia's cursor:'never'
-// constraint (which Chromium may silently fail to honor depending on which capture
-// backend it picks), this talks to Windows Graphics Capture directly, so cursor
-// exclusion does not depend on Chromium's backend-selection heuristics at all.
+// Records one monitor or window with Windows.Graphics.Capture straight into a
+// hardware-encoded H.264 MP4. The system cursor is excluded from the pixels
+// (IsCursorCaptureEnabled(false)); it is sampled separately as data (see
+// CursorSampler) on the same QPC clock as the frames' SystemRelativeTime.
 class CaptureEngine {
  public:
-  using FrameCallback = std::function<void(const CapturedFrame&)>;
+  struct Options {
+    std::wstring path;
+    uint32_t bitrate = 16'000'000;
+    uint32_t fps = 60;
+  };
+  struct Result {
+    bool ok = false;
+    std::wstring error;
+    uint32_t frames = 0;
+    uint32_t arrivals = 0;  // frames Windows delivered, before the fps cap
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int64_t firstFrame100ns = 0;  // QPC time of video t=0
+    int64_t stop100ns = 0;
+    double firstFrameWallMs = 0;  // video t=0 on the Date.now() clock
+  };
 
   ~CaptureEngine();
 
-  // Starts capturing the monitor identified by its HMONITOR value (see
-  // EnumerateMonitors). Returns false (with errorOut set) if the current
-  // Windows build/driver stack cannot create a capture session at all —
-  // this is a hard capability check, not a "hope for the best" attempt.
-  bool Start(uint64_t monitorHandle, FrameCallback onFrame, std::wstring& errorOut);
+  bool StartMonitor(uint64_t monitorHandle, const Options& opts, std::wstring& error);
+  bool StartWindow(uint64_t hwnd, const Options& opts, std::wstring& error);
+  // Blocking: stops capture and finalizes the file.
+  Result Stop();
 
-  // Starts capturing a single window by its HWND. Window sources go through
-  // Chromium's own getDisplayMedia capture path fine on this hardware class —
-  // it's full-screen sources that fail to honor cursor:'never' — but
-  // Chromium's own window capturer (also WGC-backed) has been observed
-  // failing ProcessFrame calls (E_FAIL) and papering over it by re-delivering
-  // the last good frame, which reads as the recording freezing on one frame
-  // while the real window keeps changing. Routing windows through this same,
-  // already-hardened capture engine sidesteps that unreliable code path
-  // entirely rather than trying to detect a frozen stream after the fact.
-  bool StartWindow(uint64_t hwnd, FrameCallback onFrame, std::wstring& errorOut);
-  void Stop();
-
-  bool IsCursorExclusionSupported() const { return m_cursorExclusionSupported; }
+  uint32_t Width() const { return m_width; }
+  uint32_t Height() const { return m_height; }
 
   struct MonitorInfo {
     uint64_t handle;
@@ -62,21 +56,34 @@ class CaptureEngine {
   };
   static std::vector<MonitorInfo> EnumerateMonitors();
 
+  struct RectInfo {
+    int32_t x, y, width, height;
+    bool ok;
+  };
+  // DWM extended frame bounds (what WGC actually captures), physical pixels.
+  static RectInfo GetWindowBounds(uint64_t hwnd);
+
+  // One cursor-free frame of a monitor, downscaled to maxWidth, as BGRA —
+  // for source-picker previews Chromium can't produce (e.g. monitors on the
+  // other GPU of a hybrid laptop). Uses its own short-lived device so it
+  // never touches a recording in progress.
+  struct Thumbnail {
+    bool ok = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> bgra;
+    std::wstring error;
+  };
+  static Thumbnail CaptureMonitorThumbnail(uint64_t monitorHandle, uint32_t maxWidth);
+
  private:
-  // Shared by Start() and StartWindow() — everything past item creation
-  // (device, frame pool, cursor-exclusion, session) is identical for a
-  // monitor item and a window item.
-  bool StartWithItem(winrt::Windows::Graphics::Capture::GraphicsCaptureItem item,
-                      FrameCallback onFrame, std::wstring& errorOut);
+  bool StartWithItem(winrt::Windows::Graphics::Capture::GraphicsCaptureItem item, HMONITOR monitor,
+                     const Options& opts, std::wstring& error);
+  void OnFrameArrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender,
+                      winrt::Windows::Foundation::IInspectable const& args);
+  void WritePending(int64_t until100ns);
 
-  void OnFrameArrived(
-      winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender,
-      winrt::Windows::Foundation::IInspectable const& args);
-  // Fully-qualified everywhere this type appears: the Windows SDK headers
-  // pulled in for D3D11/DXGI interop also declare a raw COM ::IInspectable,
-  // and an unqualified `IInspectable` under `using namespace
-  // winrt::Windows::Foundation` is ambiguous between the two.
-
+  LUID m_adapterLuid{};
   winrt::com_ptr<ID3D11Device> m_d3dDevice;
   winrt::com_ptr<ID3D11DeviceContext> m_d3dContext;
   winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_device{nullptr};
@@ -85,7 +92,23 @@ class CaptureEngine {
   winrt::Windows::Graphics::Capture::GraphicsCaptureSession m_session{nullptr};
   winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::FrameArrived_revoker m_frameArrivedRevoker;
 
-  FrameCallback m_onFrame;
-  bool m_cursorExclusionSupported = false;
+  std::mutex m_frameMutex;  // serializes frame handling against Stop()
   std::atomic<bool> m_running{false};
+  VideoEncoder m_encoder;
+  std::wstring m_error;
+
+  uint32_t m_width = 0;
+  uint32_t m_height = 0;
+  int64_t m_slot100ns = 166'666;
+  int64_t m_lastSlot = -1;
+
+  // Each frame is written once the next one arrives, so its duration is the
+  // real time it stayed on screen (the capture is variable-frame-rate: a
+  // still screen produces no new frames).
+  winrt::com_ptr<ID3D11Texture2D> m_pending;
+  int64_t m_pendingTime = 0;
+  int64_t m_first = -1;
+  double m_firstWallMs = 0;
+  uint32_t m_frames = 0;
+  uint32_t m_arrivals = 0;
 };

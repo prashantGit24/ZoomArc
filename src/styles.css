@@ -100,7 +100,7 @@ body {
    the content area — everywhere else the OS draws its own titlebar above
    this one, so reserving space for them here would just be dead padding. */
 html[data-platform='darwin'] .titlebar { padding-left: 88px; }
-.titlebar .logo { width: 26px; height: 26px; border-radius: 7px; flex: none; box-shadow: 0 0 0 1px var(--line); }
+.titlebar .logo { width: 26px; height: 26px; flex: none; }
 .titlebar h1 { font-size: 14px; font-weight: 700; letter-spacing: -0.01em; margin: 0; }
 .titlebar button, .titlebar label, .titlebar input { -webkit-app-region: no-drag; }
 
@@ -205,7 +205,7 @@ html[data-platform='darwin'] .titlebar { padding-left: 88px; }
    same lone card doesn't instead balloon to fill the whole row. */
 .wall { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
 .src {
-  display: flex; flex-direction: column; max-width: 320px;
+  display: flex; flex-direction: column; width: 100%; max-width: 320px;
   position: relative; text-align: left; cursor: pointer;
   background: var(--panel); border: 1px solid var(--line-soft); border-radius: 12px;
   padding: 7px 7px 0; color: var(--text); overflow: visible;
@@ -214,7 +214,7 @@ html[data-platform='darwin'] .titlebar { padding-left: 88px; }
 .src:hover { border-color: var(--line); background: var(--panel-2); transform: translateY(-1px); }
 .src[aria-pressed='true'] { border-color: var(--accent); }
 .src .screen {
-  position: relative; aspect-ratio: 16/9; overflow: hidden; border-radius: 7px;
+  display: block; width: 100%; position: relative; aspect-ratio: 16/9; overflow: hidden; border-radius: 7px;
   background: #000; border: 1px solid #000;
 }
 .src[aria-pressed='true'] .screen::after {
@@ -222,6 +222,11 @@ html[data-platform='darwin'] .titlebar { padding-left: 88px; }
   box-shadow: inset 0 0 0 2px var(--accent), 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 .src .screen img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.src .screen-placeholder {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  color: rgba(255, 255, 255, 0.55); font-size: 13px; font-weight: 600;
+  background: linear-gradient(135deg, #1d1d24, #0f0f13);
+}
 /* Grid, not flex, for this row — a flex item's minimum width defaults to its
    content size (not 0), which silently defeats text-overflow: ellipsis next
    to a fixed-width sibling. minmax(0, 1fr) sidesteps that entirely. */
@@ -318,22 +323,134 @@ html[data-platform='darwin'] .titlebar { padding-left: 88px; }
 .undo button { margin-left: auto; flex: none; font-weight: 600; font-size: 12px; color: var(--accent); padding: 3px 8px; border-radius: 5px; }
 .undo button:hover { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 
-.overlay {
-  height: 100vh; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 14px;
-}
-.overlay p { color: var(--dim); margin: 0; }
-.overlay h2 { margin: 0; }
-.count { font-size: 96px; font-weight: 200; }
 kbd {
   background: var(--panel-2); border: 1px solid var(--line);
   border-radius: 5px; padding: 2px 6px; font-family: var(--font-mono); font-size: 0.9em;
 }
-.rec-dot {
-  width: 16px; height: 16px; border-radius: 50%; background: var(--accent);
-  animation: pulse 1.4s ease-in-out infinite;
+
+/* ----------------------------------------------------- recording screen */
+/* Recreated from the "recording dashboard" design: a dark card with a purple
+   arc dial on a lavender backdrop. The card is laid out at the design's own
+   1121x632 size and scaled to fit (see RecordingScreen.jsx). */
+.rec-screen {
+  --rec-page: #cdc2fa;
+  --rec-page-glow: #ddd5ff;
+  min-height: 100vh; display: grid; place-items: center; padding: 24px;
+  background: radial-gradient(70% 70% at 50% 45%, var(--rec-page-glow), var(--rec-page) 75%);
+  font-family: 'Outfit', var(--font-sans);
 }
-@keyframes pulse { 50% { opacity: 0.25; } }
+:root[data-theme='dark'] .rec-screen { --rec-page: #0d0a1f; --rec-page-glow: #241a52; }
+.rec-stage { position: relative; }
+.rec-card2 {
+  position: absolute; top: 0; left: 0; width: 1121px; height: 632px; transform-origin: 0 0;
+  border-radius: 46px; overflow: hidden;
+  background:
+    radial-gradient(55% 75% at 22% 50%, rgba(98, 66, 230, 0.22), transparent 70%),
+    radial-gradient(60% 60% at 70% 40%, rgba(60, 44, 150, 0.12), transparent 70%),
+    #0a0918;
+  border: 2px solid #ddd3ff;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.35),
+    0 30px 80px -20px rgba(76, 52, 190, 0.55),
+    0 0 60px 6px rgba(160, 135, 255, 0.35);
+}
+.rec2 { position: absolute; inset: 0; color: #f3f0ff; }
+
+/* dial */
+.rec-dial { position: absolute; inset: 0; width: 100%; height: 100%; }
+.rec-dial .tick { stroke: #6a59d6; stroke-width: 2.4; stroke-linecap: round; }
+.rec-dial .tick.main { stroke: #9a86ff; stroke-width: 3; }
+.rec-dial .scale { font: 500 21px 'Outfit', var(--font-sans); fill: #8a83b3; }
+.rec-dial .scale.active { font-weight: 700; fill: #ffffff; font-size: 22px; }
+.rec-dial .scale-unit { font: 600 12px 'Outfit', var(--font-sans); fill: #6f68a0; letter-spacing: 0.12em; text-transform: uppercase; }
+.rec-dial .scale-mark { stroke: #8b7cf6; stroke-width: 3; stroke-linecap: round; }
+.rec-dial .pointer { fill: #ffffff; }
+.rec2.live .rec-dial .band.upper { animation: rec-band 3.2s ease-in-out infinite; }
+@keyframes rec-band { 50% { filter: brightness(1.18); } }
+.rec2.saving .rec-dial, .rec2.counting .rec-dial { opacity: 0.85; }
+
+/* top-right status */
+.rec2-top { position: absolute; top: 27px; right: 55px; display: flex; align-items: center; gap: 24px; }
+.rec2-badge {
+  display: inline-flex; align-items: center; gap: 14px; height: 48px; padding: 0 22px 0 22px;
+  border-radius: 24px; background: #1a1730; border: 1px solid rgba(255, 255, 255, 0.09);
+  font-size: 21px; font-weight: 600; letter-spacing: 0.02em; color: #a07cf5;
+}
+.rec2-badge i { width: 18px; height: 18px; border-radius: 50%; background: #ff2a3d; box-shadow: 0 0 12px rgba(255, 42, 61, 0.7); }
+.rec2.live .rec2-badge i { animation: rec-blink 1.4s ease-in-out infinite; }
+@keyframes rec-blink { 50% { opacity: 0.35; box-shadow: none; } }
+.rec2.saving .rec2-badge, .rec2.counting .rec2-badge { color: #b9b2db; }
+.rec2.saving .rec2-badge i, .rec2.counting .rec2-badge i { background: #8b7cf6; box-shadow: 0 0 10px rgba(139, 124, 246, 0.6); }
+.rec2-fps { display: inline-flex; align-items: center; gap: 14px; font-size: 21px; color: #ece8ff; }
+.rec2-fps svg { color: #d9d2ff; }
+
+/* centre column */
+.rec2-timer {
+  position: absolute; left: 330px; width: 600px; top: 112px; text-align: center;
+  font-size: 104px; font-weight: 700; line-height: 1; letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums; color: #f6f3ff;
+  text-shadow: 0 0 30px rgba(170, 150, 255, 0.25);
+}
+.rec2-timer.count { animation: rec-count 0.7s ease-out; }
+@keyframes rec-count { from { transform: scale(0.82); opacity: 0.3; } to { transform: scale(1); opacity: 1; } }
+.rec2-title {
+  position: absolute; left: 330px; width: 600px; top: 233px; margin: 0; text-align: center;
+  font-size: 36px; font-weight: 600; color: #c4b5fd; letter-spacing: 0;
+}
+.rec2-sub {
+  position: absolute; left: 290px; width: 700px; top: 285px; margin: 0; text-align: center;
+  font-size: 21px; color: #b4a7e6;
+}
+.rec2-chips { position: absolute; left: 309px; width: 721px; top: 347px; display: flex; justify-content: space-between; gap: 12px; }
+.rec2-chip {
+  display: inline-flex; align-items: center; justify-content: center; gap: 13px; height: 58px; padding: 0 22px;
+  border-radius: 29px; background: #15132a; border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 19px; color: #c9c3e6; white-space: nowrap; flex: none;
+}
+/* Only chips carrying a long name (source, a real mic/camera label) give up width. */
+.rec2-chip.shrink { flex: 0 1 auto; min-width: 0; }
+.rec2-chip > span { overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+.rec2-chip svg { flex: none; color: #d4ceef; }
+.rec2-chip.strong { color: #ffffff; font-weight: 600; }
+
+.rec2-stop {
+  position: absolute; left: 314px; width: 716px; top: 442px; height: 76px;
+  display: flex; align-items: center; justify-content: center; gap: 22px;
+  border: 0; border-radius: 38px; cursor: pointer;
+  font: 600 25px 'Outfit', var(--font-sans); color: #ffffff;
+  background: linear-gradient(90deg, #5847e6 0%, #7458f0 50%, #a56cfc 100%);
+  box-shadow: 0 12px 34px -8px rgba(120, 84, 250, 0.75), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  transition: filter 0.15s ease, transform 0.1s ease;
+}
+.rec2-stop:hover { filter: brightness(1.1); }
+.rec2-stop:active { transform: translateY(1px); }
+.rec2-stop:focus-visible { outline: 3px solid #c4b5fd; outline-offset: 4px; }
+.rec2-stop-icon { width: 23px; height: 23px; border-radius: 4px; background: #ffffff; }
+.rec2-stop.placeholder {
+  cursor: default; background: #15132a; border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #c9c3e6; box-shadow: none; font-weight: 500;
+}
+.rec2-spinner {
+  width: 24px; height: 24px; border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.15); border-top-color: #a56cfc; animation: rec-spin 0.8s linear infinite;
+}
+@keyframes rec-spin { to { transform: rotate(360deg); } }
+
+.rec2-hint {
+  position: absolute; left: 309px; width: 721px; top: 547px; height: 40px; margin: 0;
+  display: flex; align-items: center; justify-content: center; gap: 12px; font-size: 19px; color: #a9a3c9;
+}
+.rec2-keygroup { display: inline-flex; align-items: center; gap: 12px; }
+.rec2-plus { color: #a9a3c9; }
+.rec2-hint kbd {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 40px; height: 38px; padding: 0 14px;
+  border-radius: 8px; background: #16142a; border: 1px solid rgba(255, 255, 255, 0.1);
+  font: 500 17px 'Outfit', var(--font-sans); color: #d8d3f0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rec2 *, .rec2 .rec-dial * { animation: none !important; }
+}
 
 /* --------------------------------------------------------------- transport */
 
@@ -449,6 +566,39 @@ kbd {
 .inspector hr { border: none; border-top: 1px solid var(--line); width: 100%; margin: 2px 0; }
 .inspector .subsection { display: flex; flex-direction: column; gap: 12px; }
 .hint { color: var(--dim); font-size: 11px; line-height: 1.5; margin: 0; }
+
+/* Keyboard shortcuts overlay (press ?) */
+.kbd-btn { font-weight: 700; font-size: 14px; }
+.shortcuts-backdrop {
+  position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.55); backdrop-filter: blur(2px); padding: 24px;
+}
+.shortcuts-panel {
+  width: min(980px, 100%); max-height: 100%; overflow: auto; outline: none;
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: 0 24px 60px var(--shadow); padding: 20px 24px 24px;
+}
+.shortcuts-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.shortcuts-head h2 { margin: 0; font-size: 17px; }
+.shortcuts-close { display: inline-flex; align-items: center; gap: 8px; height: auto; padding: 4px 5px 4px 10px; line-height: 1; }
+.shortcuts-head .shortcuts-close kbd { padding: 3px 5px; font-size: 10px; box-shadow: none; }
+.shortcuts-grid { columns: 3 250px; column-gap: 28px; }
+.shortcuts-grid section { break-inside: avoid; margin-bottom: 18px; }
+.shortcuts-grid h3 {
+  margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim);
+}
+.shortcuts-grid dl { margin: 0; }
+.shortcut-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 5px 0; border-bottom: 1px solid var(--line-soft); font-size: 12.5px;
+}
+.shortcut-row dt { color: var(--text); }
+.shortcut-row dd { margin: 0; display: flex; gap: 4px; flex-shrink: 0; }
+.shortcuts-panel kbd, .shortcuts-head kbd {
+  font-family: var(--font-mono); font-size: 11px; line-height: 1; padding: 4px 6px; min-width: 20px;
+  text-align: center; border-radius: 5px; border: 1px solid var(--line);
+  background: var(--field); color: var(--text); box-shadow: 0 1px 0 var(--line);
+}
 
 .field-label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--dim); }
 .text-input.textarea { resize: vertical; min-height: 44px; font-size: 12.5px; }

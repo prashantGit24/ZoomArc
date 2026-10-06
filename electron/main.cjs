@@ -1,20 +1,16 @@
-const { app, BrowserWindow, ipcMain, desktopCapturer, screen, dialog, shell, globalShortcut, systemPreferences, session } = require('electron')
+const { app, BrowserWindow, Menu, nativeImage, ipcMain, desktopCapturer, screen, dialog, shell, globalShortcut, systemPreferences, session } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 const os = require('node:os')
 const { MouseTracker } = require('./mouse-tracker.cjs')
 const { ExportQueue } = require('./export-queue.cjs')
-const { FORMATS, QUALITY_PRESETS, DEFAULT_QUALITY } = require('./exporter.cjs')
+const { FORMATS, QUALITY_PRESETS, DEFAULT_QUALITY, resolveFfmpeg } = require('./exporter.cjs')
+const { spawn } = require('node:child_process')
 
-// Windows Graphics Capture fallback: only reached when getDisplayMedia's
-// cursor:'never' constraint comes back unhonored (settings.cursor !== 'never'
-// on the negotiated track) — see Recorder.jsx's captureStream(). Chromium's
-// backend selection for that constraint isn't guaranteed on every Windows/GPU
-// driver combination, so this talks to Windows.Graphics.Capture directly
-// instead, where cursor exclusion is verified via IsCursorCaptureEnabled
-// rather than hoped for. Optional at the module level: on any platform other
-// than Windows, or a dev machine without the native addon built, this stays
-// null and nativeCapture:isSupported simply reports false.
+// Native Windows recording (Windows.Graphics.Capture -> hardware H.264, plus a
+// cursor sampler on the same clock). The primary path on Windows; elsewhere,
+// or without the addon built, this stays null and the renderer falls back to
+// getDisplayMedia + the uiohook MouseTracker.
 let wgcCapture = null
 if (process.platform === 'win32') {
   try {
@@ -51,7 +47,7 @@ function cleanName(name, fallback = 'Recording') {
   return clean || fallback
 }
 
-// Everything for one take lives in its own folder: raw.webm + mouse.json
+// Everything for one take lives in its own folder: raw.mp4 (or raw.webm) + mouse.json
 function newTakeDir() {
   const dir = path.join(app.getPath('userData'), 'takes', String(Date.now()))
   fs.mkdirSync(dir, { recursive: true })
@@ -74,6 +70,10 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      // The window is minimized while recording, but this renderer is what
+      // draws native frames into the recorded canvas — throttled, frames pile
+      // up and the video lags the cursor by hundreds of ms.
+      backgroundThrottling: false,
     },
   })
 
@@ -107,32 +107,59 @@ ipcMain.handle('capture:arm', (_e, sourceId) => {
   return true
 })
 
-// Windows Graphics Capture fallback (see wgcCapture require above). Frames
-// stream out via 'nativeCapture:frame' to whichever window started the
-// capture, rather than a return value — MediaRecorder-speed delivery has no
-// business going through ipcMain.handle's request/response round trip.
+// Native Windows recording (native/wgc-capture): the capture module records
+// straight to a hardware-encoded MP4 and samples the system cursor on the same
+// clock, so nothing frame-sized ever crosses into JS.
 ipcMain.handle('nativeCapture:isSupported', () => !!wgcCapture?.isSupported())
 ipcMain.handle('nativeCapture:listMonitors', () => wgcCapture?.listMonitors() || [])
-ipcMain.handle('nativeCapture:start', (event, monitorHandle) => {
-  if (!wgcCapture) throw new Error('Windows Graphics Capture is not available on this build')
-  const sender = event.sender
-  return wgcCapture.start(String(monitorHandle), (frame) => {
-    if (!sender.isDestroyed()) sender.send('nativeCapture:frame', frame)
-  })
-})
-ipcMain.handle('nativeCapture:startWindow', (event, hwnd) => {
-  if (!wgcCapture) throw new Error('Windows Graphics Capture is not available on this build')
-  const sender = event.sender
-  return wgcCapture.startWindow(String(hwnd), (frame) => {
-    if (!sender.isDestroyed()) sender.send('nativeCapture:frame', frame)
-  })
-})
-ipcMain.handle('nativeCapture:stop', () => {
-  wgcCapture?.stop()
-  return true
-})
+ipcMain.handle('nativeCapture:getWindowBounds', (_e, hwnd) => wgcCapture?.getWindowBounds(String(hwnd)) || { ok: false })
+
+const REPO_URL = 'https://github.com/prashantGit24/ZoomArc'
+
+// Electron's default menu, except Help: that one pointed at electronjs.org.
+function buildMenu() {
+  const isMac = process.platform === 'darwin'
+  const template = [
+    ...(isMac ? [{ role: 'appMenu' }] : []),
+    { role: 'fileMenu' },
+    { role: 'editMenu' },
+    { role: 'viewMenu' },
+    { role: 'windowMenu' },
+    {
+      role: 'help',
+      submenu: [
+        {
+          label: 'Keyboard Shortcuts',
+          accelerator: 'CmdOrCtrl+/',
+          click: () => win?.webContents.send('help:shortcuts'),
+        },
+        { type: 'separator' },
+        { label: 'ZoomArc on GitHub', click: () => shell.openExternal(REPO_URL) },
+        { label: "What's New (Changelog)", click: () => shell.openExternal(`${REPO_URL}/blob/main/CHANGELOG.md`) },
+        { label: 'Report an Issue', click: () => shell.openExternal(`${REPO_URL}/issues`) },
+        ...(isMac
+          ? []
+          : [
+              { type: 'separator' },
+              {
+                label: 'About ZoomArc',
+                click: () =>
+                  dialog.showMessageBox(win, {
+                    type: 'info',
+                    title: 'About ZoomArc',
+                    message: `ZoomArc ${app.getVersion()}`,
+                    detail: `Screen recorder with cursor-driven zoom.\n\nElectron ${process.versions.electron} · Chromium ${process.versions.chrome}`,
+                  }),
+              },
+            ]),
+      ],
+    },
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+}
 
 app.whenReady().then(() => {
+  buildMenu()
   exports_.attach()
   session.defaultSession.setDisplayMediaRequestHandler(
     async (_request, callback) => {
@@ -192,6 +219,18 @@ ipcMain.handle('permissions:open', (_e, kind) => {
   return false
 })
 
+// A preview grabbed by the native module, for monitors Chromium can't see.
+async function nativeThumbnail(handle) {
+  try {
+    const t = await wgcCapture.captureMonitorThumbnail(String(handle), 480)
+    if (!t) return null
+    return nativeImage.createFromBitmap(t.bgra, { width: t.width, height: t.height }).toDataURL()
+  } catch (e) {
+    console.warn('monitor preview failed:', e.message)
+    return null
+  }
+}
+
 ipcMain.handle('sources:list', async () => {
   const sources = await desktopCapturer.getSources({
     types: ['screen', 'window'],
@@ -199,7 +238,7 @@ ipcMain.handle('sources:list', async () => {
     fetchWindowIcons: false,
   })
   const displays = screen.getAllDisplays()
-  return sources.map((s) => {
+  const list = sources.map((s) => {
     // display_id lets us map global cursor coords into this source's pixel space
     const display = displays.find((d) => String(d.id) === String(s.display_id))
     return {
@@ -212,6 +251,31 @@ ipcMain.handle('sources:list', async () => {
         : null,
     }
   })
+  if (!wgcCapture?.isSupported()) return list
+
+  // Chromium's screen list can miss monitors outright (on hybrid-GPU laptops
+  // it only sees one GPU's outputs), so with native capture the monitors come
+  // from Windows itself; Chromium's entry only lends its thumbnail.
+  const chromiumScreens = list.filter((s) => s.kind === 'screen')
+  const monitors = wgcCapture.listMonitors().sort((a, b) => b.primary - a.primary)
+  const screens = await Promise.all(monitors.map(async (m, i) => {
+    const display = displays.reduce((best, d) => {
+      const dist = (x) => Math.abs(Math.round(x.bounds.x * x.scaleFactor) - m.x) + Math.abs(Math.round(x.bounds.y * x.scaleFactor) - m.y)
+      return !best || dist(d) < dist(best) ? d : best
+    }, null)
+    const chromium = chromiumScreens.find(
+      (s) => display && s.display && s.display.bounds.x === display.bounds.x && s.display.bounds.y === display.bounds.y,
+    )
+    return {
+      id: chromium?.id || `monitor:${m.handle}`,
+      name: m.primary ? 'Main display' : `Display ${i + 1}`,
+      kind: 'screen',
+      thumbnail: chromium?.thumbnail || (await nativeThumbnail(m.handle)),
+      display: display ? { bounds: display.bounds, scaleFactor: display.scaleFactor } : null,
+      monitor: m.handle,
+    }
+  }))
+  return [...screens, ...list.filter((s) => s.kind !== 'screen')]
 })
 
 /* -------------------------------------------------------------- recording */
@@ -232,82 +296,176 @@ function armStopHotkey() {
   globalShortcut.register(STOP_HOTKEY, () => win?.webContents.send('record:stop-hotkey'))
 }
 
-ipcMain.handle('record:start', (_e, meta) => {
+const delay = (ms) => new Promise((r) => setTimeout(r, ms))
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(resolveFfmpeg(), ['-hide_banner', '-loglevel', 'error', '-y', ...args], { windowsHide: true })
+    let stderr = ''
+    p.stderr.on('data', (d) => (stderr += d))
+    p.on('error', reject)
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited with ${code}: ${stderr.slice(-500)}`))))
+  })
+}
+
+// Positive: the input started that many seconds after video frame 0.
+const offsetArgs = (sec) => (sec > 0.005 ? ['-itsoffset', sec.toFixed(3)] : sec < -0.005 ? ['-ss', (-sec).toFixed(3)] : [])
+
+ipcMain.handle('record:start', async (_e, meta) => {
   take = { dir: newTakeDir(), startedAt: Date.now(), meta }
-  tracker.start()
   armStopHotkey()
   // Get the app out of the shot; the hotkey brings the session back.
   if (meta?.hideWindow !== false) win?.minimize()
+
+  if (meta?.native && wgcCapture) {
+    // Native capture starts immediately, so let the minimize animation finish
+    // first or it ends up in the opening frames.
+    if (meta.hideWindow !== false) await delay(300)
+    const { kind, handle, bitrate } = meta.native
+    const monitor = kind === 'monitor' ? wgcCapture.listMonitors().find((m) => m.handle === String(handle)) : null
+    try {
+      const size = wgcCapture.startRecording({
+        kind,
+        handle: String(handle),
+        path: path.join(take.dir, 'video.mp4'),
+        bitrate,
+        fps: 60,
+      })
+      take.native = { kind, width: size.width, height: size.height, origin: monitor ? { x: monitor.x, y: monitor.y } : null }
+    } catch (e) {
+      globalShortcut.unregister(STOP_HOTKEY)
+      win?.restore()
+      fs.rmSync(take.dir, { recursive: true, force: true })
+      take = null
+      throw e
+    }
+    return { dir: take.dir, stopHotkey: STOP_HOTKEY, t0: take.startedAt }
+  }
+
+  tracker.start()
   // take.startedAt is also the tracker's own zero (see MouseTracker.start).
-  // The renderer doesn't actually start encoding until some time after this
-  // handler returns (IPC round trip, MediaRecorder.start()), so it hands that
-  // real gap back at record:finish as offsetMs — without it, mouse timestamps
-  // are zeroed too early and every effect that follows the cursor reads stale,
-  // "delayed" positions relative to the video.
+  // The renderer starts encoding some time after this returns; it hands that
+  // gap back at record:finish as offsetMs.
   return { dir: take.dir, stopHotkey: STOP_HOTKEY, t0: take.startedAt }
 })
 
-ipcMain.handle('record:cancel', () => {
-  tracker.stop()
+ipcMain.handle('record:cancel', async () => {
   globalShortcut.unregister(STOP_HOTKEY)
   win?.restore()
+  if (take?.native) await wgcCapture.stopRecording().catch(() => {})
+  else tracker.stop()
   if (take) fs.rmSync(take.dir, { recursive: true, force: true })
   take = null
   return true
 })
 
-// Renderer hands back the recorded blob; we pair it with the mouse track.
-ipcMain.handle('record:finish', async (_e, { buffer, durationMs, videoSize, offsetMs, cameraBuffer, camera }) => {
+// Renderer hands back what it recorded (screen video in browser mode, or just
+// the mic in native mode, plus the webcam); we pair it with the cursor track.
+ipcMain.handle('record:finish', async (_e, payload) => {
   if (!take) throw new Error('no active take')
-  const rawEvents = tracker.stop()
+  const current = take
+  take = null
   globalShortcut.unregister(STOP_HOTKEY)
-  win?.restore()
-  win?.focus()
+  try {
+    return current.native ? await finishNative(current, payload) : finishBrowser(current, payload)
+  } finally {
+    win?.restore()
+    win?.focus()
+  }
+})
 
-  const videoPath = path.join(take.dir, 'raw.webm')
-  fs.writeFileSync(videoPath, Buffer.from(buffer))
+async function finishNative(t, { buffer, startWallMs, cameraBuffer, camera }) {
+  const res = await wgcCapture.stopRecording()
+  if (!res.ok) throw new Error(res.error || 'The recording failed')
 
-  // The webcam recording is a separate file (not composited in yet) so the
-  // editor can reposition/restyle the pill without ever re-encoding the
-  // screen capture. Same-length, same start time as the main recording.
+  const video = path.join(t.dir, 'video.mp4')
+  const videoPath = path.join(t.dir, 'raw.mp4')
+  // Mic and webcam were started (on the Date.now() clock) a moment after
+  // frame 0; offsetting them by exactly that keeps them in sync with the video.
+  const startOffset = startWallMs ? (startWallMs - res.firstFrameWallMs) / 1000 : 0
+  if (buffer) {
+    const mic = path.join(t.dir, 'mic.webm')
+    fs.writeFileSync(mic, Buffer.from(buffer))
+    await runFfmpeg([
+      '-i', video, ...offsetArgs(startOffset), '-i', mic,
+      '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+      '-movflags', '+faststart', videoPath,
+    ])
+    fs.rmSync(mic, { force: true })
+    fs.rmSync(video, { force: true })
+  } else {
+    fs.renameSync(video, videoPath)
+  }
+
   let cameraPath = null
   if (cameraBuffer) {
-    cameraPath = path.join(take.dir, 'camera.webm')
+    cameraPath = path.join(t.dir, 'camera.webm')
+    const rawCam = path.join(t.dir, 'camera-raw.webm')
+    fs.writeFileSync(rawCam, Buffer.from(cameraBuffer))
+    try {
+      await runFfmpeg([...offsetArgs(startOffset), '-i', rawCam, '-c', 'copy', cameraPath])
+      fs.rmSync(rawCam, { force: true })
+    } catch (e) {
+      console.warn('camera alignment failed, keeping it unshifted:', e.message)
+      fs.renameSync(rawCam, cameraPath)
+    }
+  }
+
+  const track = {
+    version: 2,
+    // Cursor and video share one clock: event t is milliseconds on the
+    // video's own timeline, no offset estimation involved.
+    clock: 'native',
+    name: cleanName(t.meta?.projectName, defaultTakeName(t.startedAt)),
+    startedAt: t.startedAt,
+    durationMs: res.durationMs,
+    videoSize: { width: res.width, height: res.height },
+    // Physical pixels: event x/y map to video pixels as (x - origin) / size.
+    // A window's origin moves with it, carried by 'bounds' events instead.
+    capture: { kind: t.native.kind, origin: t.native.origin, width: res.width, height: res.height },
+    stats: { frames: res.frames, delivered: res.arrivals, cursorPolls: res.cursorPolls },
+    source: t.meta,
+    camera: cameraPath ? camera || {} : null,
+    events: res.cursor,
+  }
+  fs.writeFileSync(path.join(t.dir, 'mouse.json'), JSON.stringify(track))
+  return { dir: t.dir, videoPath, cameraPath, track }
+}
+
+function finishBrowser(t, { buffer, durationMs, videoSize, offsetMs, cameraBuffer, camera }) {
+  const rawEvents = tracker.stop()
+  const videoPath = path.join(t.dir, 'raw.webm')
+  fs.writeFileSync(videoPath, Buffer.from(buffer))
+
+  let cameraPath = null
+  if (cameraBuffer) {
+    cameraPath = path.join(t.dir, 'camera.webm')
     fs.writeFileSync(cameraPath, Buffer.from(cameraBuffer))
   }
 
-  // The tracker's clock (t0 = take.startedAt) starts before the video actually
-  // does — offsetMs is that gap, measured by the renderer. Re-zero events onto
-  // the video's own timeline so a sample at video-time t reads the mouse
-  // position from the same real instant, instead of one `offsetMs` stale.
+  // The tracker's clock (t0 = take.startedAt) starts before the video does;
+  // offsetMs is that gap, so re-zero events onto the video's own timeline.
   const shift = Math.max(0, Math.round(offsetMs) || 0)
   const shifted = rawEvents.map((e) => ({ ...e, t: e.t - shift }))
   const events = shifted.filter((e) => e.t >= 0)
-  // Pre-roll (captured before the video actually started) is discarded, but
-  // the cursor's last known position from it has to survive as the state at
-  // t=0 — otherwise the path holds at wherever the first post-roll move
-  // happens to be instead of where the pointer actually was when frame 0 hit.
+  // Keep the cursor's last pre-roll position as its state at t=0.
   const lastPreRollMove = [...shifted].reverse().find((e) => e.t < 0 && e.type === 'move')
   if (lastPreRollMove) events.unshift({ ...lastPreRollMove, t: 0 })
 
   const track = {
     version: 1,
-    name: cleanName(take.meta?.projectName, defaultTakeName(take.startedAt)),
-    // Measured, not assumed: see MouseTracker.probeScale.
+    name: cleanName(t.meta?.projectName, defaultTakeName(t.startedAt)),
     pointerScale: tracker.getPointerScale(),
-    startedAt: take.startedAt,
+    startedAt: t.startedAt,
     durationMs,
     videoSize,
-    source: take.meta,
-    camera: cameraPath ? camera || {} : null, // { deviceId, label, width, height }
+    source: t.meta,
+    camera: cameraPath ? camera || {} : null,
     events, // [{ t, x, y, type }] t = ms since the video's own start
   }
-  fs.writeFileSync(path.join(take.dir, 'mouse.json'), JSON.stringify(track))
-
-  const result = { dir: take.dir, videoPath, cameraPath, track }
-  take = null
-  return result
-})
+  fs.writeFileSync(path.join(t.dir, 'mouse.json'), JSON.stringify(track))
+  return { dir: t.dir, videoPath, cameraPath, track }
+}
 
 /* ----------------------------------------------------------------- takes */
 
@@ -336,6 +494,12 @@ ipcMain.handle('takes:rename', (_e, dir, name) => {
   return track.name
 })
 
+// Native takes are raw.mp4 (hardware H.264); browser-path takes are raw.webm.
+function takeVideo(dir) {
+  const mp4 = path.join(dir, 'raw.mp4')
+  return fs.existsSync(mp4) ? mp4 : path.join(dir, 'raw.webm')
+}
+
 function takesRoot() {
   return path.join(app.getPath('userData'), 'takes')
 }
@@ -346,7 +510,7 @@ ipcMain.handle('takes:list', async () => {
   return fs
     .readdirSync(root)
     .map((name) => path.join(root, name))
-    .filter((dir) => fs.existsSync(path.join(dir, 'raw.webm')))
+    .filter((dir) => fs.existsSync(takeVideo(dir)) && fs.existsSync(path.join(dir, 'mouse.json')))
     .sort()
     .reverse()
     .map((dir) => {
@@ -355,7 +519,7 @@ ipcMain.handle('takes:list', async () => {
       const cameraFile = path.join(dir, 'camera.webm')
       return {
         dir,
-        videoPath: path.join(dir, 'raw.webm'),
+        videoPath: takeVideo(dir),
         cameraPath: fs.existsSync(cameraFile) ? cameraFile : null,
         track,
       }
@@ -371,7 +535,7 @@ ipcMain.handle('takes:load', async (_e, dir) => {
   const cameraFile = path.join(dir, 'camera.webm')
   return {
     dir,
-    videoPath: path.join(dir, 'raw.webm'),
+    videoPath: takeVideo(dir),
     cameraPath: fs.existsSync(cameraFile) ? cameraFile : null,
     track,
   }
