@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://prashantgit24.github.io/ZoomArc/sitemap.xml
