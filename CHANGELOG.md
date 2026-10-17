@@ -4,6 +4,27 @@ All notable changes to ZoomArc are documented here, newest first.
 
 > **A note on completeness:** detailed notes exist for every version from 0.10.0 onward. Versions 0.1.0 through 0.9.4 were early, rapid iteration (several same-day releases) before this changelog existed — they're listed below with their real release dates for the record, but without invented feature lists. Please don't read anything into their brevity beyond "detailed notes weren't kept at the time."
 
+## [0.12.1] — 2026-10-17
+
+Transparent-export fixes. If you export with a transparent background, update to this version.
+
+### Fixed
+- **Transparent export formats appeared not to work.** The formats labelled "(transparent)" — MOV · ProRes 4444, MKV · FFV1 and PNG sequence — only keep transparency that the background *already has*; picking one didn't make the background transparent. With the default gradient (or a colour or image background) still behind the recording, the export came out solid, so the transparent option looked broken.
+  - Choosing a transparent format while the background is solid now shows **"Background isn't transparent"** in the editor header with a one-click **Make transparent** button (keeps the chosen format).
+  - Verified with real exports through the app: MOV (ProRes 4444 XQ, `yuva444p12le`), MKV (FFV1, `bgra`) and PNG sequence all carry a true alpha channel — areas outside the recording and its shadow are fully transparent.
+- **Transparent background exported as solid black.** Setting **Background → Transparent** while the export format was MP4 (the default) silently flattened the background to black, with only a small header warning.
+  - Turning the background transparent now switches the export to **MOV · ProRes 4444** automatically.
+  - Exporting a transparent background as MP4 or regular WebM now asks for confirmation first, explaining that the background will be black and which formats keep transparency.
+- **Couldn't tell what would be transparent.** The editor preview showed transparent areas as dark grey. It now shows a **checkerboard** behind transparent areas (preview only — not exported).
+- Outdated note in the Background panel claiming WebM can't be transparent.
+
+### Added
+- **WebM · VP9 (transparent)** export format — VP9 with a real alpha channel (`alpha_mode=1`). Plays with transparency in Chrome, Edge, OBS, web pages and most editors, making it the easiest transparent format to preview. Quality presets apply.
+
+### Notes
+- Windows' built-in video players often display a MOV's transparent areas as **black** even though the file is transparent. Check MOV exports in DaVinci Resolve, Premiere Pro, After Effects or OBS — or export **WebM (transparent)** and open it in Chrome.
+- In **Frame** mode the recording grows to fill the whole canvas while zoomed, so there's no transparent margin during zooms (by design). Use **Video** mode to keep the transparent margin throughout.
+
 ## [0.12.0] — 2026-10-07
 
 The precision-recording release: a new native recording engine, exact 1:1 cursor motion, and a redesigned recording screen.

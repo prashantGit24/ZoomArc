@@ -502,6 +502,14 @@ kbd {
    nothing. This is what makes .stage's own overflow:auto the thing that
    handles the overflow (via scrolling) instead of flexbox fighting it. */
 .stage-frame { position: relative; flex: none; }
+/* Transparent background: show a checkerboard behind the preview so it's
+   obvious which areas will be see-through in the export. Preview only. */
+.stage-frame.transparent canvas {
+  background-color: #c9c9cf;
+  background-image:
+    conic-gradient(#9d9da6 25%, transparent 0 50%, #9d9da6 0 75%, transparent 0);
+  background-size: 22px 22px;
+}
 .stage canvas {
   display: block; width: 100%; height: 100%; border-radius: 10px;
   box-shadow: 0 0 0 1px var(--ed-line), 0 20px 60px rgba(0, 0, 0, 0.55);
@@ -978,6 +986,8 @@ kbd {
 }
 .select.pill:hover { border-color: color-mix(in srgb, var(--ed-accent) 50%, var(--line)); }
 .warn { color: var(--warn); font-size: 11px; -webkit-app-region: no-drag; }
+.warn.alpha-hint { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.warn.alpha-hint .btn { padding: 3px 9px; font-size: 11px; }
 
 /* -------------------------------------------------------- device pickers */
 .device-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }

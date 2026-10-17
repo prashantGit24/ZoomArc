@@ -75,9 +75,9 @@ const FORMATS = {
     // point rather than a target bitrate. Not preset-tunable — see above.
     video: () => ['-c:v', 'prores_ks', '-profile:v', '4444xq', '-qscale:v', '1', '-pix_fmt', 'yuva444p10le', '-alpha_bits', '16'],
   },
-  // ffmpeg's WebM muxer cannot write VP9/VP8 alpha (it lives in Matroska
-  // BlockAdditional, which the muxer drops), so this one is opaque by design —
-  // it is here for small web-friendly files, not for transparency.
+  // Opaque 4:4:4 WebM for sharp, small web files. VP9 alpha needs 4:2:0
+  // (yuva420p), so transparency is its own format below rather than a mode
+  // of this one.
   webm: {
     label: 'WebM · VP9 (4:4:4)',
     ext: 'webm',
@@ -89,6 +89,18 @@ const FORMATS = {
       q.vp9Lossless
         ? ['-c:v', 'libvpx-vp9', '-profile:v', '1', '-pix_fmt', 'yuv444p', '-lossless', '1', '-row-mt', '1']
         : ['-c:v', 'libvpx-vp9', '-profile:v', '1', '-pix_fmt', 'yuv444p', '-crf', String(q.vp9Crf), '-b:v', '0', '-row-mt', '1'],
+  },
+  // Transparent WebM: VP9 with an alpha plane (stored as Matroska
+  // BlockAdditional, alpha_mode=1). The transparent format that previews
+  // correctly almost everywhere — Chrome/Edge, OBS, web pages, most editors —
+  // where ProRes 4444's alpha is often shown as black by Windows players.
+  webmAlpha: {
+    label: 'WebM · VP9 (transparent)',
+    ext: 'webm',
+    alpha: true,
+    frameType: 'image/png',
+    frameCodec: 'png',
+    video: (q) => ['-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-crf', String(q.vp9Lossless ? 12 : q.vp9Crf), '-b:v', '0', '-row-mt', '1'],
   },
   // FFV1 in Matroska: mathematically lossless like mov/png, but sidesteps
   // ProRes licensing/tooling expectations and, by encoding straight to planar

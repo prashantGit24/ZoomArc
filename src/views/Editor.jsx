@@ -1222,6 +1222,20 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
     project.background?.type === 'none' ||
     project.backgroundClips.some((c) => c.bg?.type === 'none')
 
+  // Choosing a transparent background while on a format that can't keep
+  // alpha (MP4 is the default) used to silently export a black background.
+  // Switch to MOV (ProRes 4444) the moment transparency is turned on; the
+  // user can still pick another format afterwards, and export double-checks.
+  const wasTransparentRef = useRef(usesTransparency)
+  useEffect(() => {
+    const turnedOn = usesTransparency && !wasTransparentRef.current
+    wasTransparentRef.current = usesTransparency
+    if (turnedOn && activeFormat && !activeFormat.alpha) {
+      setFormat('mov')
+      setStatus({ kind: 'ok', message: 'Switched export to MOV · ProRes 4444 to keep the background transparent.' })
+    }
+  }, [usesTransparency, activeFormat])
+
   const selectedSegment = selected?.kind === 'zoom' ? project.segments.find((s) => s.id === selected.id) : null
   const selectedClip = selected?.kind === 'bg' ? project.backgroundClips.find((c) => c.id === selected.id) : null
   const selectedText = selected?.kind === 'text' ? (project.texts || []).find((it) => it.id === selected.id) : null
@@ -1332,6 +1346,17 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
 
   async function runExport() {
     if (queuing) return
+    if (
+      usesTransparency &&
+      activeFormat &&
+      !activeFormat.alpha &&
+      !window.confirm(
+        `${activeFormat.label} can't store transparency, so the transparent background will export as solid black.\n\n` +
+          'For transparency choose MOV, WebM (transparent), MKV or PNG sequence.\n\nExport anyway?',
+      )
+    ) {
+      return
+    }
     setQueuing(true)
     try {
       const project = await inlineImages(projectRef.current)
@@ -1392,8 +1417,19 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
         )}
         <div className="row">
           {usesTransparency && !activeFormat?.alpha && (
-            <span className="warn" title="Pick MOV or PNG sequence to keep transparency">
+            <span className="warn" title="Pick MOV, WebM (transparent), MKV or PNG sequence to keep transparency">
               ⚠ {activeFormat?.ext?.toUpperCase() || 'This format'} has no alpha
+            </span>
+          )}
+          {/* A "(transparent)" format only keeps transparency the background
+              actually has — with a gradient/colour/image background the
+              export is opaque, which reads as the format not working. */}
+          {!usesTransparency && activeFormat?.alpha && (
+            <span className="warn alpha-hint" title="Transparent formats keep the background's transparency — but the background is currently solid">
+              Background isn't transparent
+              <button type="button" className="btn sm" onClick={() => patch({ background: defaultBg('none', project.background) })}>
+                Make transparent
+              </button>
             </span>
           )}
           <select
@@ -1510,7 +1546,7 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
         <div className="stage" ref={stageRef}>
           <div
             ref={frameRef}
-            className="stage-frame"
+            className={`stage-frame ${usesTransparency ? 'transparent' : ''}`}
             style={{ width: frameSize.width * previewScale, height: frameSize.height * previewScale }}
           >
             <canvas ref={canvasRef} width={frameSize.width} height={frameSize.height} onClick={handleCanvasClick} />
@@ -1886,7 +1922,7 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
                 <p className="hint">
                   Transparent. Keep the alpha channel by exporting as{' '}
                   {formats.filter((f) => f.alpha).map((f) => f.label).join(' or ') || 'an alpha format'} —
-                  MP4 and WebM have no alpha and would flatten it to black.
+                  MP4 and the regular WebM have no alpha and would flatten it to black.
                 </p>
               )}
 
