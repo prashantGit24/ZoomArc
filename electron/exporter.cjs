@@ -148,7 +148,25 @@ const DEFAULT_QUALITY = 'lossless'
  * composited frame offscreen and pushes it here in order, so export is
  * deterministic rather than a realtime screen-grab of the preview.
  */
-function exportVideo({ outPath, fps = 60, width, height, audioPath, quality = DEFAULT_QUALITY, format = 'mp4' }) {
+// ffmpeg filter that rebuilds the recording's audio to match the edited
+// video track: each clip's slice of the recording, placed where that clip now
+// plays. Null when the video is a single untouched clip (nothing to rebuild).
+function audioEditFilter(clips) {
+  const list = (clips || []).filter((c) => c.end - c.start > 0.01).sort((a, b) => a.start - b.start)
+  const untouched = list.length === 1 && Math.abs(list[0].start) < 0.001 && Math.abs(list[0].sourceStart) < 0.001
+  if (!list.length || untouched) return null
+  const parts = list.map((c, i) => {
+    const delay = Math.max(0, Math.round(c.start * 1000))
+    return `[1:a]atrim=start=${c.sourceStart.toFixed(3)}:end=${c.sourceEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delay}:all=1[a${i}]`
+  })
+  const mix =
+    list.length === 1
+      ? '[a0]apad[aout]'
+      : `${list.map((_, i) => `[a${i}]`).join('')}amix=inputs=${list.length}:normalize=0:dropout_transition=0,apad[aout]`
+  return [...parts, mix].join(';')
+}
+
+function exportVideo({ outPath, fps = 60, width, height, audioPath, audioClips, quality = DEFAULT_QUALITY, format = 'mp4' }) {
   const fmt = FORMATS[format] || FORMATS.mp4
   const q = QUALITY_PRESETS[quality] || QUALITY_PRESETS[DEFAULT_QUALITY]
   const args = ['-y', '-f', 'image2pipe', '-vcodec', fmt.frameCodec, '-r', String(fps), '-i', 'pipe:0']
@@ -162,7 +180,9 @@ function exportVideo({ outPath, fps = 60, width, height, audioPath, quality = DE
 
   const hasAudio = !fmt.sequence && audioPath && fs.existsSync(audioPath)
   if (hasAudio) {
-    args.push('-i', audioPath, '-map', '0:v:0', '-map', '1:a:0?')
+    const edit = audioEditFilter(audioClips)
+    if (edit) args.push('-i', audioPath, '-filter_complex', edit, '-map', '0:v:0', '-map', '[aout]')
+    else args.push('-i', audioPath, '-map', '0:v:0', '-map', '1:a:0?')
     // flac for mkv keeps the audio lossless too, matching the video codec —
     // no point encoding bit-exact FFV1 video next to lossy audio.
     if (fmt.ext === 'webm') args.push('-c:a', 'libopus', '-b:a', '192k')
@@ -237,4 +257,4 @@ function exportVideo({ outPath, fps = 60, width, height, audioPath, quality = DE
   }
 }
 
-module.exports = { exportVideo, resolveFfmpeg, FORMATS, QUALITY_PRESETS, DEFAULT_QUALITY }
+module.exports = { exportVideo, audioEditFilter, resolveFfmpeg, FORMATS, QUALITY_PRESETS, DEFAULT_QUALITY }

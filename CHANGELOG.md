@@ -4,6 +4,24 @@ All notable changes to ZoomArc are documented here, newest first.
 
 > **A note on completeness:** detailed notes exist for every version from 0.10.0 onward. Versions 0.1.0 through 0.9.4 were early, rapid iteration (several same-day releases) before this changelog existed — they're listed below with their real release dates for the record, but without invented feature lists. Please don't read anything into their brevity beyond "detailed notes weren't kept at the time."
 
+## [0.12.2] — 2026-10-17
+
+Timeline editing fixes: cuts now close their gaps, moved clips keep their footage, and click marks stay on the video they belong to.
+
+### Fixed
+- **Deleting a cut piece left an empty gap.** Splitting a clip and deleting a piece left blank space on the timeline (and black frames in the export). Deleting a video piece is now a **ripple delete**: everything after it slides left to close the gap, so deleting the first piece makes the rest start at 0:00.
+  - Webcam clips, zooms, text, shapes, elements and background clips over the deleted span are trimmed or removed with it, and everything after it shifts by the same amount.
+  - Undo/redo restores the deleted piece and the gap exactly.
+- **Moving a clip shifted its footage — clicks and cursor no longer matched the video.** Dragging a video clip was sometimes treated as a trim, because of a tiny floating-point difference, so the clip moved but the footage inside it slid too. Dragging now always moves the clip with its footage intact, so the cursor and click effects stay in sync.
+- **Exports kept the original recording length after cuts.** The export rendered the full recording length, leaving dead time at the end after cutting. It now ends where the edited timeline ends (verified: an 18.46 s recording cut by 10 s exports at 8.47 s).
+- **Mic audio didn't follow edits.** The audio was always the untouched recording, so after cutting or moving clips it drifted out of sync with the picture. The exported audio is now rebuilt from each clip's slice of the recording and placed where that clip plays (verified to the frame with a test tone).
+- **Re-detect clicks placed zooms at recording time.** After cuts, regenerated zooms landed on the wrong footage or in removed sections. They're now mapped onto the edited timeline, and zooms over cut footage are dropped.
+
+### Changed
+- **Click marks moved onto the video clips.** The amber click markers used to sit on the zoom lane at fixed recording times, so they stopped matching the video as soon as a clip was moved or cut. They're now drawn on the video clip itself, move with it, and disappear with any footage you cut out.
+- **Linked editing.** Moving or trimming a video clip carries its matching webcam clip with it, and a move also carries the zooms inside the clip. Splitting a video clip splits its webcam clip at the same point.
+- The timeline now ends a little after the last clip (a 1 s / 5% tail) instead of at the raw recording length, so it shrinks as you cut.
+
 ## [0.12.1] — 2026-10-17
 
 Transparent-export fixes. If you export with a transparent background, update to this version.

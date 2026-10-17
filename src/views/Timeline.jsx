@@ -454,16 +454,24 @@ export default function Timeline({
       case 'camera':
         return cameraClips.map((c) => block(c, 'camera', 'Camera', cameraClips))
       case 'video':
-        return videoClips.map((c) => block(c, 'video', 'Recording', videoClips))
-      case 'zoom':
         return (
           <>
-            {clicks.map((c, i) => (
-              <span key={i} className="click" style={{ left: pct(c.t) }} title={`click @ ${fmt(c.t)}`} />
-            ))}
-            {segments.map((s) => block(s, 'zoom', `${s.scale.toFixed(1)}×${s.follow ? ' follow' : ''}`, segments))}
+            {videoClips.map((c) => block(c, 'video', 'Recording', videoClips))}
+            {/* Clicks are in recording time, so they're placed through each
+                clip's footage mapping: they ride along when a clip is moved,
+                shift with ripple deletes, and vanish with cut-out footage. */}
+            {videoClips.flatMap((v) =>
+              clicks
+                .filter((c) => c.t >= v.sourceStart && c.t < v.sourceEnd)
+                .map((c, i) => {
+                  const at = v.start + (c.t - v.sourceStart)
+                  return <span key={`${v.id}-${i}`} className="click" style={{ left: pct(at) }} title={`click @ ${fmt(at)}`} />
+                }),
+            )}
           </>
         )
+      case 'zoom':
+        return segments.map((s) => block(s, 'zoom', `${s.scale.toFixed(1)}×${s.follow ? ' follow' : ''}`, segments))
       case 'background':
         return backgroundClips.map((c) => block(c, 'bg', c.bg.type === 'gradient' ? c.bg.preset : c.bg.type, backgroundClips))
       case 'text':

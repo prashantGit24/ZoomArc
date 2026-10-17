@@ -63,9 +63,10 @@ export function loadVideo(url) {
  * Renders every frame in order, handing each encoded JPEG to `onFrame`.
  * `onFrame` is awaited, which is what applies encoder backpressure.
  */
-export async function renderAllFrames({ video, cameraVideo, track, project, fps, width, height, frameType = 'image/jpeg', onFrame, onProgress, shouldStop }) {
+export async function renderAllFrames({ video, cameraVideo, track, project, fps, width, height, duration: editedDuration, frameType = 'image/jpeg', onFrame, onProgress, shouldStop }) {
   const path = buildMousePath(track)
-  const duration = path.duration || (track.durationMs || 0) / 1000
+  // The edited timeline's length (cuts close their gaps), not the raw recording's.
+  const duration = editedDuration || path.duration || (track.durationMs || 0) / 1000
   const total = Math.max(1, Math.ceil(duration * fps))
   const images = await loadImages(project)
 

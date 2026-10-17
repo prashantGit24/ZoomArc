@@ -106,6 +106,8 @@ class ExportQueue extends EventEmitter {
       width: job.width,
       height: job.height,
       audioPath: job.audioPath,
+      // The mic audio has to follow the same cuts/moves as the video clips.
+      audioClips: job.project?.videoClips || null,
       format: job.format,
       quality: job.quality,
     })
@@ -161,6 +163,7 @@ class ExportQueue extends EventEmitter {
         track: job.track,
         project: job.project,
         fps: job.fps,
+        durationSec: job.durationSec,
         width: job.width,
         height: job.height,
         frameType: (FORMATS[job.format] || FORMATS.mp4).frameType,

@@ -34,6 +34,7 @@ window.exportHost.onJob(async (job) => {
       track: job.track,
       project: job.project,
       fps: job.fps,
+      duration: job.durationSec,
       width: job.width,
       height: job.height,
       frameType: job.frameType,

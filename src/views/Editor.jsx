@@ -4,6 +4,7 @@ import Timeline from './Timeline.jsx'
 import logo from '../assets/logo.png'
 import { buildMousePath } from '../render/track.js'
 import { autoZooms, normalizeSegments, newId, DEFAULT_ZOOM } from '../render/zoom.js'
+import { contentEnd, rippleDelete, applyVideoChange, splitAt, sameSpan, segmentsToTimeline } from '../render/timelineEdit.js'
 import {
   renderFrame,
   contentRect,
@@ -206,7 +207,11 @@ function applyClipChange(item, changes, sourceDuration) {
 
   const dStart = (changes.start ?? item.start) - item.start
   const dEnd = (changes.end ?? item.end) - item.end
-  if (dStart === dEnd) return next // a move: same footage, just relocated on the timeline
+  // A move: same footage, just relocated on the timeline. Compared with a
+  // tolerance — a drag's start/end deltas differ by float rounding, and an
+  // exact === sent moves down the trim path below, which shifted the clip's
+  // footage (so clicks/cursor no longer matched the picture).
+  if (Math.abs(dStart - dEnd) < 1e-6) return { ...next, end: next.start + (item.end - item.start) }
 
   if (dStart) {
     const wanted = item.sourceStart + dStart
@@ -317,7 +322,14 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
   // the usual "Animate position changes" ease rate.
   const webcamDraggingRef = useRef(false)
 
-  const duration = path.duration || track.durationMs / 1000
+  // The original recording's length — the limit for trimming footage back out.
+  const recordingDuration = path.duration || track.durationMs / 1000
+  // Where the edited video ends (last clip or overlay): playback, the time
+  // readout and export all stop here, so cut-out time never lingers.
+  const endTime = contentEnd(project) || recordingDuration
+  // A little room past the end so the last clip can still be dragged or
+  // trimmed outward; it grows as the content does.
+  const duration = endTime + Math.max(1, endTime * 0.05)
   const out = track.videoSize || { width: 1920, height: 1080 }
 
   /* --------------------------------------------------------------- layers */
@@ -491,8 +503,8 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
         const correction = lockToVideo(t)
         anchorTime += correction
         t += correction
-        if (t >= duration) {
-          t = duration
+        if (t >= endTime) {
+          t = endTime
           setPlaying(false)
         }
         setTime(t)
@@ -510,10 +522,10 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
     }
     raf = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(raf)
-  }, [draw, playing, duration])
+  }, [draw, playing, endTime])
 
   const seek = (t) => {
-    const clamped = Math.max(0, Math.min(duration, t))
+    const clamped = Math.max(0, Math.min(endTime, t))
     setTime(clamped)
     const videoAt = clipTimeAt(clamped, project.videoClips)
     if (videoAt != null && videoRef.current) videoRef.current.currentTime = videoAt
@@ -528,7 +540,7 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
       cameraRef.current?.pause()
       setPlaying(false)
     } else {
-      if (timeRef.current >= duration - 0.05) seek(0)
+      if (timeRef.current >= endTime - 0.05) seek(0)
       setPlaying(true) // the loop above takes it from here — playing/pausing/seeking each track as its clips require
     }
   }
@@ -682,7 +694,7 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
 
   // Every item boundary on every track, for jumping between edits.
   const jumpEdit = (dir) => {
-    const pts = new Set([0, duration])
+    const pts = new Set([0, endTime])
     for (const key of Object.values(KIND_TO_ARRAY)) {
       for (const it of projectRef.current[key] || []) {
         pts.add(it.start)
@@ -802,7 +814,7 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
         case 'Home':
           return run(() => seek(0))
         case 'End':
-          return run(() => seek(duration))
+          return run(() => seek(endTime))
         case 'Delete':
         case 'Backspace':
           if (selected) run(removeSelected)
@@ -904,10 +916,15 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
         return { ...p, segments: normalizeSegments(segments, duration) }
       }
       const arrayKey = KIND_TO_ARRAY[kind]
-      return {
+      const next = {
         ...p,
-        [arrayKey]: (p[arrayKey] || []).map((it) => (it.id === id ? applyClipChange(it, changes, duration) : it)),
+        [arrayKey]: (p[arrayKey] || []).map((it) => (it.id === id ? applyClipChange(it, changes, recordingDuration) : it)),
       }
+      if (kind !== 'video' || !('start' in changes || 'end' in changes)) return next
+      // Video clips drag their linked webcam clip and their zooms along.
+      const before = p.videoClips.find((c) => c.id === id)
+      const after = next.videoClips.find((c) => c.id === id)
+      return before && after ? applyVideoChange(next, before, after, applyClipChange, recordingDuration) : next
     })
 
   const addZoom = () => {
@@ -1011,6 +1028,15 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
     const layerKey = KIND_TO_LAYER[selected.kind]
     if (layerKey && layerLocked(layerKey)) return flashHint('That layer is locked — unlock it in Layers to edit.')
     const arrayKey = KIND_TO_ARRAY[selected.kind]
+    if (selected.kind === 'video') {
+      // Ripple delete: close the gap so the rest of the video slides left —
+      // delete the first piece and what's left starts at 0. The linked
+      // webcam footage and zooms over the removed span go with it.
+      const clip = project.videoClips.find((c) => c.id === selected.id)
+      if (clip) updateProject((p) => rippleDelete(p, clip.start, clip.end, clip.id))
+      setSelected(null)
+      return
+    }
     updateProject((p) => ({ ...p, [arrayKey]: (p[arrayKey] || []).filter((it) => it.id !== selected.id) }))
     setSelected(null)
   }
@@ -1029,18 +1055,20 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
       return flashHint('Move the playhead inside the selected item to split it.')
     }
     const rightId = newId()
-    // Video/Camera clips also carry a sourceStart/sourceEnd in/out mapping
-    // into the recording — split that at the matching point too, so each
-    // half still plays the right footage instead of both ending up mapped
-    // to the original clip's full (now too-wide) source range.
-    const hasSource = item.sourceStart != null
-    const splitSource = hasSource ? item.sourceStart + (time - item.start) : undefined
-    updateProject((p) => ({
-      ...p,
-      [arrayKey]: p[arrayKey]
-        .map((it) => (it.id === item.id ? { ...it, end: time, ...(hasSource ? { sourceEnd: splitSource } : {}) } : it))
-        .concat({ ...item, id: rightId, start: time, ...(hasSource ? { sourceStart: splitSource } : {}) }),
-    }))
+    // Video/Camera clips also split their in/out mapping into the recording
+    // (see splitAt), so each half still plays the right footage.
+    const splitIn = (items, target, id) =>
+      items.flatMap((it) => (it.id === target.id ? splitAt(it, time, id) : [it]))
+    updateProject((p) => {
+      const next = { ...p, [arrayKey]: splitIn(p[arrayKey], item, rightId) }
+      // Cutting the video also cuts its linked webcam clip at the same point,
+      // so the two keep moving and ripple-deleting together.
+      if (selected.kind === 'video') {
+        const cam = (p.cameraClips || []).find((c) => sameSpan(c, item) && time > c.start + 0.05 && time < c.end - 0.05)
+        if (cam) next.cameraClips = splitIn(p.cameraClips, cam, newId())
+      }
+      return next
+    })
     setSelected({ kind: selected.kind, id: rightId })
   }
 
@@ -1212,7 +1240,9 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
 
   const regenerate = () => {
     if (layerLocked('zoom')) return flashHint('The Zoom layer is locked — unlock it in Layers to edit.')
-    updateProject((p) => ({ ...p, segments: autoZooms(path, { scale: p.segments[0]?.scale ?? 2 }) }))
+    // Clicks are in recording time; place their zooms where that footage
+    // plays on the edited timeline (and drop zooms on cut-out footage).
+    updateProject((p) => ({ ...p, segments: segmentsToTimeline(autoZooms(path, { scale: p.segments[0]?.scale ?? 2 }), p.videoClips) }))
   }
 
   const activeFormat = formats.find((f) => f.id === format)
@@ -1369,7 +1399,7 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
         fps: 60,
         format,
         quality,
-        durationSec: duration,
+        durationSec: endTime,
         width: exportSize.width,
         height: exportSize.height,
         audioPath: track.source?.mic && layerVisible('audio') ? videoPath : null,
@@ -2194,7 +2224,7 @@ export default function Editor({ take, onBack, showShortcuts, setShowShortcuts }
           {playing ? '❚❚' : '▶'}
         </button>
         <span className="time">
-          {time.toFixed(2)}s / {duration.toFixed(2)}s
+          {time.toFixed(2)}s / {endTime.toFixed(2)}s
         </span>
         <div className="row preview-tools">
           <div className="modes click-zoom-mode" title="How a Zoom segment fills the frame while it's zoomed in">
